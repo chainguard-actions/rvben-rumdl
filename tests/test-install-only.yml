@@ -1,0 +1,46 @@
+name: Test install-only mode
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        with:
+          install-only: "true"
+
+      - name: Assert rumdl-version output is set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "rumdl-version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-version=$VERSION"
+
+      - name: Assert rumdl-path output is set
+        env:
+          RUMDL_PATH: ${{ steps.action.outputs.rumdl-path }}
+        run: |
+          echo "rumdl-path: $RUMDL_PATH"
+          if [ -z "$RUMDL_PATH" ]; then
+            echo "FAIL: rumdl-path output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-path=$RUMDL_PATH"
+
+      - name: Assert rumdl is callable in subsequent steps
+        run: |
+          echo "Checking rumdl is on PATH..."
+          if ! command -v rumdl > /dev/null 2>&1; then
+            echo "FAIL: rumdl not found on PATH after install-only"
+            exit 1
+          fi
+          VERSION_OUT=$(rumdl --version)
+          echo "rumdl version: $VERSION_OUT"
+          echo "PASS: rumdl is callable as 'rumdl'"

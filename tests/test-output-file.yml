@@ -1,0 +1,45 @@
+name: Test output-file writes results to disk
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a markdown file with violations
+        run: |
+          mkdir -p /tmp/md-out
+          # MD041: First line should be a top-level heading
+          printf 'not a heading\n\n## Section\n\nContent.\n' \
+            > /tmp/md-out/violations.md
+
+      - id: action
+        uses: .
+        with:
+          command: check
+          path: /tmp/md-out/violations.md
+          fail-on-error: "false"
+          output-file: /tmp/md-out/results.txt
+
+      - name: Assert output file was created
+        run: |
+          echo "Checking output file..."
+          if [ ! -f /tmp/md-out/results.txt ]; then
+            echo "FAIL: output file /tmp/md-out/results.txt was not created"
+            exit 1
+          fi
+          echo "Output file contents:"
+          cat /tmp/md-out/results.txt
+          echo "PASS: output file exists"
+
+      - name: Assert rumdl-version output is set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "rumdl-version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-version=$VERSION"
