@@ -9,6 +9,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit |
 |---------|-----|-----------------|
 | v0.2.77 | [`v0.2.77`](https://github.com/chainguard-actions/rvben-rumdl/tree/v0.2.77) | [`bb84a49`](https://github.com/rvben/rumdl/commit/bb84a49a85625b31ecf6c3e58b7bca7c75fbfefb) |
+| v0.2.78 | [`v0.2.78`](https://github.com/chainguard-actions/rvben-rumdl/tree/v0.2.78) | [`9c4cc2a`](https://github.com/rvben/rumdl/commit/9c4cc2a2ebe176de68e1788106e25af8a9bd3899) |
 
 ## Privacy
 
