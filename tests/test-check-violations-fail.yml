@@ -1,0 +1,38 @@
+name: Test check fails on violations (fail-on-error default)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a markdown file with lint violations
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/fixtures/md-fail"
+          # MD041: first line should be a top-level heading (not plain text)
+          # MD022: headings should be surrounded by blank lines
+          printf 'some text\n# Heading without blank line\nmore text\n# Another heading\nend\n' \
+            > "$GITHUB_WORKSPACE/tests/fixtures/md-fail/bad.md"
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          command: check
+          path: tests/fixtures/md-fail/bad.md
+          fail-on-error: "true"
+
+      - name: Assert action failed due to violations
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action correctly failed when violations found with fail-on-error=true"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded (no violations detected in this file)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
