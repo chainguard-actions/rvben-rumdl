@@ -1,0 +1,38 @@
+name: Test fail-on-error false - violations do not fail workflow
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a markdown file with lint violations
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tmp-bad-md"
+          # MD022: headings should be surrounded by blank lines
+          # MD041: first line should be a top-level heading
+          printf 'some text\n# heading without blank line\nmore text\n' \
+            > "$GITHUB_WORKSPACE/tmp-bad-md/bad.md"
+
+      - id: action
+        uses: .
+        with:
+          path: tmp-bad-md/bad.md
+          command: check
+          fail-on-error: "false"
+
+      - name: Assert action succeeded despite violations
+        run: |
+          echo "PASS: action completed without failing the workflow (fail-on-error=false)"
+
+      - name: Assert rumdl-version output is still set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "rumdl-version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-version=$VERSION"

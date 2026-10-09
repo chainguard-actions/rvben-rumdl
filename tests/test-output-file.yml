@@ -1,0 +1,50 @@
+name: Test output-file - results written to file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a clean markdown file
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tmp-out-md"
+          cat > "$GITHUB_WORKSPACE/tmp-out-md/sample.md" << 'EOF'
+          # Sample Document
+
+          This is a sample markdown document.
+
+          ## Details
+
+          Some details here.
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          path: tmp-out-md/sample.md
+          command: check
+          output-file: tmp-out-md/results.txt
+
+      - name: Assert output file was created
+        run: |
+          echo "Checking output file exists..."
+          if [ ! -f "$GITHUB_WORKSPACE/tmp-out-md/results.txt" ]; then
+            echo "FAIL: output file was not created at tmp-out-md/results.txt"
+            exit 1
+          fi
+          echo "Output file contents:"
+          cat "$GITHUB_WORKSPACE/tmp-out-md/results.txt"
+          echo "PASS: output file exists"
+
+      - name: Assert rumdl-version output is set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "rumdl-version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-version=$VERSION"
