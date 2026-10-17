@@ -1,0 +1,50 @@
+name: Test fmt-check command
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a well-formatted markdown file
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/fixtures/md-fmt"
+          cat > "$GITHUB_WORKSPACE/tests/fixtures/md-fmt/formatted.md" << 'EOF'
+          # Title
+
+          This is a well-formatted markdown file.
+
+          ## Section
+
+          Content here.
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          command: fmt-check
+          path: tests/fixtures/md-fmt/formatted.md
+          fail-on-error: "true"
+
+      - name: Assert action succeeded (fmt-check on formatted file)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected fmt-check to succeed on a well-formatted file"
+            exit 1
+          fi
+          echo "PASS: fmt-check passed on formatted file"
+
+      - name: Assert rumdl-version output is set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "rumdl-version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-version is '$VERSION'"

@@ -1,0 +1,45 @@
+name: Test fail-on-error false - violations do not fail workflow
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a markdown file with violations
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/fixtures/md-violations"
+          # MD022: headings should be surrounded by blank lines
+          # MD041: first line should be a top-level heading
+          printf 'some text\n# heading without blank line\nmore text\n# another heading\nend\n' \
+            > "$GITHUB_WORKSPACE/tests/fixtures/md-violations/bad.md"
+
+      - id: action
+        uses: .
+        with:
+          command: check
+          path: tests/fixtures/md-violations/bad.md
+          fail-on-error: "false"
+
+      - name: Assert action succeeded (fail-on-error=false)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected action to succeed with fail-on-error=false, got '$OUTCOME'"
+            exit 1
+          fi
+          echo "PASS: action succeeded despite violations (fail-on-error=false)"
+
+      - name: Assert rumdl-version output is still set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "rumdl-version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          echo "PASS: rumdl-version is '$VERSION'"

@@ -1,0 +1,2503 @@
+/// Shared table detection and processing utilities for markdown linting rules
+///
+/// This module provides optimized table detection and processing functionality
+/// that can be shared across multiple table-related rules (MD055, MD056, MD058).
+use super::blockquote::{parse_blockquote_prefix, strip_blockquote_prefix};
+
+/// How many blockquotes `line` is nested in.
+fn blockquote_depth(line: &str) -> usize {
+    parse_blockquote_prefix(line).map_or(0, |parsed| parsed.nesting_level)
+}
+
+/// The container markers in front of a header row, as a byte length: blockquote
+/// markers and list markers in any order (`- > `, `> - > `, `1. - `), with the
+/// whitespace around them. `line_start` is the line's byte offset and `items` the
+/// `(start, end, content start)` offsets of the list items the parser reads: a
+/// marker that cannot be told from cell text on its own (`2.`) counts when the
+/// parser opens an item at it.
+fn header_container_prefix_len(line: &str, line_start: usize, items: &[(usize, usize, usize)]) -> usize {
+    let mut pos = 0;
+    loop {
+        let rest = &line[pos..];
+        let quote = TableUtils::extract_blockquote_prefix(rest).0.len();
+        if quote > 0 {
+            pos += quote;
+            continue;
+        }
+        let marker = TableUtils::extract_list_prefix(rest).0;
+        if marker.is_empty() {
+            return pos;
+        }
+        let marker_start = line_start + pos + (marker.len() - marker.trim_start().len());
+        let parsed_item = items
+            .binary_search_by_key(&marker_start, |&(start, _, _)| start)
+            .is_ok();
+        if !parsed_item && !opens_item_in_a_paragraph(marker) {
+            return pos;
+        }
+        pos += marker.len();
+    }
+}
+
+/// Whether `marker` is read as a list marker wherever it appears: written at most
+/// three columns in, and a bullet or `1.`, which can interrupt a paragraph. Any
+/// other marker (a longer number, `2.`, four columns of indentation) may be the
+/// first cell's text, so it is left in place.
+fn opens_item_in_a_paragraph(marker: &str) -> bool {
+    let indent = marker
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .fold(0, |column, byte| {
+            if byte == b'\t' {
+                (column / 4 + 1) * 4
+            } else {
+                column + 1
+            }
+        });
+    let number = marker.trim_start().trim_end_matches(|c: char| !c.is_ascii_digit());
+    indent < 4 && (number.is_empty() || (number.len() <= 9 && number.trim_start_matches('0') == "1"))
+}
+
+/// How many blockquotes a header row is nested in, counting those that open
+/// after a list marker (`- > |a|b|` is inside one).
+pub(crate) fn header_quote_depth(line: &str, line_start: usize, items: &[(usize, usize, usize)]) -> usize {
+    let prefix = &line[..header_container_prefix_len(line, line_start, items)];
+    prefix.bytes().filter(|&byte| byte == b'>').count()
+}
+
+/// Represents a table block in the document
+#[derive(Debug, Clone)]
+pub struct TableBlock {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub header_line: usize,
+    pub delimiter_line: usize,
+    pub content_lines: Vec<usize>,
+    /// If the table is inside a list item, this contains:
+    /// - The list marker prefix for the header line (e.g., "- ", "1. ")
+    /// - The content indent (number of spaces for continuation lines)
+    pub list_context: Option<ListTableContext>,
+    /// Whether the Markdown parser reads this block as a table. The scanner
+    /// leaves it `false`; `LintContext` sets it once the parse is available.
+    /// Rules that rewrite a table act only on confirmed blocks.
+    pub parser_confirmed: bool,
+    /// Whether the parser would read this block as a table once its delimiter row
+    /// had the header's cell count. Set only on blocks that are not confirmed;
+    /// MD056 repairs those delimiter rows and so acts on them too.
+    pub repairable: bool,
+    /// Byte length of the header's quote and list markers as the scanner read them,
+    /// with the parser's list items consulted; `None` reads them from the line alone.
+    pub header_prefix_len: Option<usize>,
+}
+
+/// Context information for tables inside list items
+#[derive(Debug, Clone)]
+pub struct ListTableContext {
+    /// The list marker prefix including any leading whitespace (e.g., "- ", "  1. ")
+    pub list_prefix: String,
+    /// Number of spaces for continuation lines to align with content
+    pub content_indent: usize,
+}
+
+/// Shared table detection utilities
+pub struct TableUtils;
+
+impl TableUtils {
+    /// Returns true if the line has at least one unescaped pipe separator outside inline code and
+    /// math spans.
+    ///
+    /// Skips pipes inside backtick code spans (`` `...` ``) and dollar-sign math spans (`$...$`,
+    /// `$$...$$`) to avoid false positives from prose like `` `echo a | sed 's/a/b/'` `` or math
+    /// like `$|S|$` (absolute value notation).
+    ///
+    /// Note: a bare `$` that opens a span without a matching closing `$` keeps the scanner in
+    /// math mode for the rest of the line, suppressing any subsequent pipes. This is conservative
+    /// and means that `$5 | $10`-style price comparisons (without outer pipes) are not detected
+    /// as table separators — an accepted trade-off to avoid false positives from real math.
+    fn has_unescaped_pipe_outside_spans(text: &str, pairs_backslashes: bool) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        let mut in_code = false;
+        let mut code_delim_len = 0usize;
+        let mut in_math = false;
+        let mut math_delim_len = 0usize;
+
+        while i < chars.len() {
+            let ch = chars[i];
+
+            if ch == '\\' && !in_code && !in_math {
+                // Skip escaped character (only outside code and math spans —
+                // backslashes are literal inside code spans per CommonMark).
+                i += if i + 1 < chars.len() { 2 } else { 1 };
+                continue;
+            }
+
+            if ch == '`' && !in_math {
+                let mut run = 1usize;
+                while i + run < chars.len() && chars[i + run] == '`' {
+                    run += 1;
+                }
+
+                if in_code {
+                    if run == code_delim_len {
+                        in_code = false;
+                        code_delim_len = 0;
+                    }
+                    // Mismatched backtick run inside a code span: consumed but span stays open.
+                } else {
+                    in_code = true;
+                    code_delim_len = run;
+                }
+
+                i += run;
+                continue;
+            }
+
+            if ch == '$' && !in_code {
+                let mut run = 1usize;
+                while i + run < chars.len() && chars[i + run] == '$' {
+                    run += 1;
+                }
+
+                if in_math {
+                    if run == math_delim_len {
+                        in_math = false;
+                        math_delim_len = 0;
+                    }
+                    // Mismatched $-run inside a math span: consumed but span stays open.
+                } else {
+                    in_math = true;
+                    math_delim_len = run;
+                }
+
+                i += run;
+                continue;
+            }
+
+            if ch == '|' && !in_code && !in_math {
+                // Without backslash pairing, a pipe right after a backslash is escaped
+                // even when that backslash was itself consumed as half of a pair.
+                if pairs_backslashes || i == 0 || chars[i - 1] != '\\' {
+                    return true;
+                }
+            }
+
+            i += 1;
+        }
+
+        false
+    }
+
+    /// Check if a line looks like a potential table row
+    /// Flavor-aware form of [`Self::is_potential_table_row`]
+    ///
+    /// Under Obsidian, a line whose only pipes sit inside wikilink aliases is
+    /// prose rather than a table row, so those pipes are masked before the check.
+    pub fn is_potential_table_row_with_flavor(line: &str, flavor: crate::config::MarkdownFlavor) -> bool {
+        // Masking is the identity without an opener to mask inside, and this runs on
+        // every line of the document.
+        let pairs = Self::pairs_backslashes(flavor);
+        if flavor == crate::config::MarkdownFlavor::Obsidian && line.contains("[[") {
+            return Self::potential_table_row(&Self::mask_pipes_in_wikilinks(line), pairs);
+        }
+        Self::potential_table_row(line, pairs)
+    }
+
+    pub fn is_potential_table_row(line: &str) -> bool {
+        Self::potential_table_row(line, false)
+    }
+
+    fn potential_table_row(line: &str, pairs_backslashes: bool) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains('|') {
+            return false;
+        }
+
+        // Skip lines that are clearly not table rows
+        // Unordered list items with space or tab after marker
+        if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ")
+            || trimmed.starts_with("-\t")
+            || trimmed.starts_with("*\t")
+            || trimmed.starts_with("+\t")
+        {
+            return false;
+        }
+
+        // Skip ordered list items: digits followed by . or ) then space/tab
+        if let Some(first_non_digit) = trimmed.find(|c: char| !c.is_ascii_digit())
+            && first_non_digit > 0
+        {
+            let after_digits = &trimmed[first_non_digit..];
+            if after_digits.starts_with(". ")
+                || after_digits.starts_with(".\t")
+                || after_digits.starts_with(") ")
+                || after_digits.starts_with(")\t")
+            {
+                return false;
+            }
+        }
+
+        // Skip ATX headings (# through ######)
+        if trimmed.starts_with('#') {
+            let hash_count = trimmed.bytes().take_while(|&b| b == b'#').count();
+            if hash_count <= 6 {
+                let after_hashes = &trimmed[hash_count..];
+                if after_hashes.is_empty() || after_hashes.starts_with(' ') || after_hashes.starts_with('\t') {
+                    return false;
+                }
+            }
+        }
+
+        // For rows without explicit outer pipes, require a real separator outside
+        // inline code and math spans to avoid prose/command false positives.
+        let has_outer_pipes = trimmed.starts_with('|') && trimmed.ends_with('|');
+        if !has_outer_pipes && !Self::has_unescaped_pipe_outside_spans(trimmed, pairs_backslashes) {
+            return false;
+        }
+
+        // Must have at least 2 parts when split by |
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        if parts.len() < 2 {
+            return false;
+        }
+
+        // Check if it looks like a table row by having reasonable content between pipes
+        let mut valid_parts = 0;
+        let mut total_non_empty_parts = 0;
+
+        for part in &parts {
+            let part_trimmed = part.trim();
+            // Skip empty parts (from leading/trailing pipes)
+            if part_trimmed.is_empty() {
+                continue;
+            }
+            total_non_empty_parts += 1;
+
+            // Count parts that look like table cells (reasonable content, no newlines)
+            if !part_trimmed.contains('\n') {
+                valid_parts += 1;
+            }
+        }
+
+        // Check if all non-empty parts are valid (no newlines)
+        if total_non_empty_parts > 0 && valid_parts != total_non_empty_parts {
+            // Some cells contain newlines, not a valid table row
+            return false;
+        }
+
+        // GFM allows tables with all empty cells (e.g., |||)
+        // These are valid if they have proper table formatting (leading and trailing pipes)
+        if total_non_empty_parts == 0 {
+            // Empty cells are only valid with proper pipe formatting
+            return trimmed.starts_with('|') && trimmed.ends_with('|') && parts.len() >= 3;
+        }
+
+        // GFM allows single-column tables, so >= 1 valid part is enough
+        // when the line has proper table formatting (pipes)
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            // Properly formatted table row with pipes on both ends
+            valid_parts >= 1
+        } else {
+            // For rows without proper pipe formatting, require at least 2 cells
+            valid_parts >= 2
+        }
+    }
+
+    /// Check if a line is a table delimiter row (e.g., |---|---|)
+    pub fn is_delimiter_row(line: &str) -> bool {
+        let trimmed = line.trim();
+        if !trimmed.contains('|') || !trimmed.contains('-') {
+            return false;
+        }
+
+        // Split by pipes and check each part
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        let mut valid_delimiter_parts = 0;
+        let mut total_non_empty_parts = 0;
+
+        for part in &parts {
+            let part_trimmed = part.trim();
+            if part_trimmed.is_empty() {
+                continue; // Skip empty parts from leading/trailing pipes
+            }
+
+            total_non_empty_parts += 1;
+
+            // Check if this part looks like a delimiter (contains dashes and optionally colons)
+            if part_trimmed.chars().all(|c| c == '-' || c == ':' || c.is_whitespace()) && part_trimmed.contains('-') {
+                valid_delimiter_parts += 1;
+            }
+        }
+
+        // All non-empty parts must be valid delimiters, and there must be at least one
+        total_non_empty_parts > 0 && valid_delimiter_parts == total_non_empty_parts
+    }
+
+    /// Find all table blocks in the content with optimized detection
+    /// This version accepts code_blocks and code_spans directly for use during LintContext construction.
+    /// `lazy_text` has one entry per line (or none): the line is indented text that
+    /// a running paragraph continues, which cannot be a table row.
+    pub fn find_table_blocks_with_code_info(
+        content: &str,
+        code_blocks: &[(usize, usize)],
+        code_spans: &[crate::lint_context::CodeSpan],
+        html_comment_ranges: &[crate::utils::skip_context::ByteRange],
+        flavor: crate::config::MarkdownFlavor,
+        lazy_text: &[bool],
+    ) -> Vec<TableBlock> {
+        let lines: Vec<&str> = content.lines().collect();
+        // Pre-compute line positions for efficient code block checking.
+        // `str::lines()` strips the trailing `\r` from CRLF lines, so advancing by
+        // `line.len() + 1` undercounts by one byte per CRLF line; the positions then
+        // drift out of sync with the raw byte offsets that `code_blocks` uses, which
+        // can misclassify a later table header as being inside a code block. Walk the
+        // actual line terminator (`\n` or `\r\n`) from the raw bytes instead.
+        let mut line_positions = Vec::with_capacity(lines.len());
+        let content_bytes = content.as_bytes();
+        let mut pos = 0;
+        for line in &lines {
+            line_positions.push(pos);
+            pos += line.len();
+            if content_bytes.get(pos) == Some(&b'\r') {
+                pos += 1;
+            }
+            if content_bytes.get(pos) == Some(&b'\n') {
+                pos += 1;
+            }
+        }
+
+        Self::find_table_blocks_with_layout(
+            &lines,
+            &line_positions,
+            code_blocks,
+            &crate::lint_context::code_span_byte_ranges(code_spans),
+            html_comment_ranges,
+            flavor,
+            lazy_text,
+            &[],
+        )
+    }
+
+    /// Context construction already has these source lines and byte offsets.
+    /// Share them rather than splitting and walking the source again. The public
+    /// entry point above retains the same behavior for independent callers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn find_table_blocks_with_layout(
+        lines: &[&str],
+        line_positions: &[usize],
+        code_blocks: &[(usize, usize)],
+        code_spans: &[(usize, usize)],
+        html_comment_ranges: &[crate::utils::skip_context::ByteRange],
+        flavor: crate::config::MarkdownFlavor,
+        lazy_text: &[bool],
+        list_items: &[(usize, usize, usize)],
+    ) -> Vec<TableBlock> {
+        let is_lazy_text = |line: usize| lazy_text.get(line).copied().unwrap_or(false);
+        let mut tables = Vec::new();
+        let mut i = 0;
+
+        // Stack of active list content indents for continuation table tracking.
+        // Supports nested lists: when a child list is seen, we push; when we
+        // dedent past a level, we pop back to the enclosing list.
+        let mut list_indent_stack: Vec<(usize, bool)> = Vec::new();
+
+        while i < lines.len() {
+            // Skip lines in code blocks, code spans, or HTML comments
+            let line_start = line_positions[i];
+            let in_code =
+                crate::utils::code_block_utils::CodeBlockUtils::is_in_code_block_or_span(code_blocks, line_start) || {
+                    // Binary search on sorted code spans
+                    let idx = code_spans.partition_point(|span| span.0 <= line_start);
+                    idx > 0 && line_start < code_spans[idx - 1].1
+                };
+            let in_html_comment = {
+                // Binary search on sorted HTML comment ranges
+                let idx = html_comment_ranges.partition_point(|range| range.start <= line_start);
+                idx > 0 && line_start < html_comment_ranges[idx - 1].end
+            };
+
+            if in_code || in_html_comment {
+                i += 1;
+                continue;
+            }
+
+            // Strip blockquote prefix for table detection
+            let line_content = strip_blockquote_prefix(lines[i]);
+
+            // Update active list tracking
+            let (list_prefix, list_content, content_indent, opened_levels) =
+                Self::extract_nested_list_prefix(line_content);
+            let line_is_quoted = line_content.len() != lines[i].len();
+            if !line_is_quoted {
+                // A line outside any blockquote ends the quote, and the lists opened in it.
+                list_indent_stack.retain(|&(_, opened_quoted)| !opened_quoted);
+            }
+            // The columns in front of a blockquote marker indented under an item count
+            // towards that item's indent, so it stays open. A list opened inside a quote
+            // is measured after the quote marker, so the columns before the marker only
+            // count for lists opened outside it.
+            let quote_indent = if line_is_quoted {
+                lines[i].len() - lines[i].trim_start().len()
+            } else {
+                0
+            };
+            let text_indent = line_content.len() - line_content.trim_start().len();
+            let indent_for = |opened_quoted: bool| {
+                if opened_quoted {
+                    text_indent
+                } else {
+                    quote_indent + text_indent
+                }
+            };
+            if !list_prefix.is_empty() {
+                // Line has list markers. Pop every item the first marker is not inside
+                // (its content starts to the right of the marker), then push each
+                // level the line opens.
+                while list_indent_stack
+                    .last()
+                    .is_some_and(|&(top, opened_quoted)| top > indent_for(opened_quoted))
+                {
+                    list_indent_stack.pop();
+                }
+                list_indent_stack.extend(opened_levels.into_iter().map(|level| (level, line_is_quoted)));
+            } else if !line_content.trim().is_empty() {
+                // Non-blank line without a marker: pop any levels we've dedented past.
+                while list_indent_stack
+                    .last()
+                    .is_some_and(|&(top, opened_quoted)| indent_for(opened_quoted) < top)
+                {
+                    list_indent_stack.pop();
+                }
+            }
+            // Blank lines keep the stack unchanged (blank lines don't end list items)
+
+            // Check if this is a list item that contains a table row on the same line,
+            // or a continuation table indented under an active list item
+            let (is_same_line_list_table, effective_content) =
+                if !list_prefix.is_empty() && Self::is_potential_table_row_content(list_content, flavor) {
+                    (true, list_content)
+                } else {
+                    (false, line_content)
+                };
+
+            // Detect continuation list tables: no marker on this line, but indented
+            // under an active list item (e.g., "- Text\n  | h1 | h2 |")
+            let continuation_indent = if !is_same_line_list_table && list_prefix.is_empty() {
+                let leading = line_content.len() - line_content.trim_start().len();
+                // Find the deepest list level this line is indented under
+                list_indent_stack
+                    .iter()
+                    .rev()
+                    // A quoted row is measured against the columns after its quote
+                    // marker, which an item opened outside the quote does not share.
+                    .filter(|&&(_, opened_quoted)| opened_quoted || !line_is_quoted)
+                    .find(|&&(indent, _)| leading >= indent)
+                    .map(|&(indent, _)| indent)
+            } else {
+                None
+            };
+
+            let is_continuation_list_table = continuation_indent.is_some()
+                && {
+                    let indent = continuation_indent.unwrap();
+                    let leading = line_content.len() - line_content.trim_start().len();
+                    // Per CommonMark, 4+ spaces beyond content indent is a code block
+                    leading < indent + 4
+                }
+                && Self::is_potential_table_row_with_flavor(effective_content, flavor);
+
+            let is_any_list_table = is_same_line_list_table || is_continuation_list_table;
+
+            // For continuation list tables, use the matched list indent
+            let effective_content_indent = if is_same_line_list_table {
+                content_indent
+            } else if is_continuation_list_table {
+                continuation_indent.unwrap()
+            } else {
+                0
+            };
+
+            // A row indented too far to start a block is text the paragraph above
+            // it continues, so it is neither a header row nor a delimiter row.
+            if is_lazy_text(i) || is_lazy_text(i + 1) {
+                i += 1;
+                continue;
+            }
+
+            // Look for potential table start
+            if is_any_list_table || Self::is_potential_table_row_with_flavor(effective_content, flavor) {
+                // For list tables (same-line or continuation), check indented continuation lines
+                // For regular tables, check the next line directly
+                let (next_line_content, delimiter_has_valid_indent) = if i + 1 < lines.len() {
+                    let next_raw = strip_blockquote_prefix(lines[i + 1]);
+                    if is_any_list_table {
+                        // Verify the delimiter line has proper indentation
+                        let leading_spaces = next_raw.len() - next_raw.trim_start().len();
+                        if leading_spaces >= effective_content_indent {
+                            // Has proper indentation, strip it and check as delimiter
+                            (
+                                Self::strip_list_continuation_indent(next_raw, effective_content_indent),
+                                true,
+                            )
+                        } else {
+                            // Not enough indentation - not a list table
+                            (next_raw, false)
+                        }
+                    } else {
+                        (next_raw, true)
+                    }
+                } else {
+                    ("", true)
+                };
+
+                // For list tables, only accept if delimiter has valid indentation
+                let effective_is_list_table = is_any_list_table && delimiter_has_valid_indent;
+
+                if i + 1 < lines.len() && Self::is_delimiter_row(next_line_content) {
+                    // Found a table! Find its end
+                    let table_start = i;
+                    let header_line = i;
+                    let delimiter_line = i + 1;
+                    let mut table_end = i + 1; // Include the delimiter row
+                    let mut content_lines = Vec::new();
+
+                    // Continue while we have table rows
+                    let header_prefix_len = header_container_prefix_len(lines[i], line_positions[i], list_items);
+                    let table_depth = lines[i][..header_prefix_len]
+                        .bytes()
+                        .filter(|&byte| byte == b'>')
+                        .count();
+                    let mut j = i + 2;
+                    while j < lines.len() {
+                        let line = lines[j];
+                        // Strip blockquote prefix for checking
+                        let raw_content = strip_blockquote_prefix(line);
+
+                        // For list tables, strip expected indentation
+                        let line_content = if effective_is_list_table {
+                            Self::strip_list_continuation_indent(raw_content, effective_content_indent)
+                        } else {
+                            raw_content
+                        };
+
+                        if line_content.trim().is_empty() {
+                            // Empty line ends the table
+                            break;
+                        }
+
+                        // For list tables, the continuation line must have proper indentation
+                        if effective_is_list_table {
+                            let leading_spaces = raw_content.len() - raw_content.trim_start().len();
+                            if leading_spaces < effective_content_indent {
+                                // Not enough indentation - end of table
+                                break;
+                            }
+                        }
+
+                        // A row belongs to the container the table is in, and
+                        // every other non-blank line is a row, with or without
+                        // pipes, until another block starts. The Obsidian
+                        // flavor keeps requiring a pipe outside a wikilink, so
+                        // a paragraph holding a wikilink alias stays prose.
+                        if blockquote_depth(line) != table_depth
+                            || Self::starts_block_after_table(line_content)
+                            || (flavor == crate::config::MarkdownFlavor::Obsidian
+                                && !Self::is_potential_table_row_with_flavor(line_content, flavor))
+                        {
+                            break;
+                        }
+                        content_lines.push(j);
+                        table_end = j;
+                        j += 1;
+                    }
+
+                    let list_context = if effective_is_list_table {
+                        if is_same_line_list_table {
+                            // Same-line: prefix is the actual list marker (e.g., "- ")
+                            Some(ListTableContext {
+                                list_prefix: list_prefix.to_string(),
+                                content_indent: effective_content_indent,
+                            })
+                        } else {
+                            // Continuation: prefix is the indentation spaces
+                            Some(ListTableContext {
+                                list_prefix: " ".repeat(effective_content_indent),
+                                content_indent: effective_content_indent,
+                            })
+                        }
+                    } else {
+                        None
+                    };
+
+                    tables.push(TableBlock {
+                        start_line: table_start,
+                        end_line: table_end,
+                        header_line,
+                        delimiter_line,
+                        content_lines,
+                        list_context,
+                        parser_confirmed: false,
+                        repairable: false,
+                        header_prefix_len: Some(header_prefix_len),
+                    });
+                    i = table_end + 1;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        tables
+    }
+
+    /// Whether `line`, a line after a table's rows inside the table's own
+    /// container, starts a block and so ends the table. GFM ends a table only
+    /// at a blank line or the start of another block, so any other line is a
+    /// row, pipes or not.
+    ///
+    /// Only the openers markdown-rs and pulldown-cmark agree on count. Where
+    /// they disagree (a line indented four columns, `#` followed by a tab, a
+    /// type-7 HTML tag, a footnote label with a space in it) the line is taken
+    /// as a row: a rule then leaves it alone rather than rewrite it, or insert
+    /// a blank line before it, on the strength of one parser's reading.
+    ///
+    /// A colon fence is the one exception. GFM has no such block, but every
+    /// syntax that writes `:::` (Pandoc and Quarto divs, MyST, Azure DevOps,
+    /// Docusaurus and VitePress admonitions, generic directives) opens or
+    /// closes a container there, and a table row holding only colons is not
+    /// something anyone writes on purpose.
+    pub(crate) fn starts_block_after_table(line: &str) -> bool {
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent >= 4 || line[indent..].starts_with('\t') {
+            return false;
+        }
+        let text = line[indent..].trim_end();
+        let bytes = text.as_bytes();
+        let Some(&first) = bytes.first() else {
+            return false;
+        };
+        let space_or_end = |at: usize| bytes.get(at).is_none_or(|&b| b == b' ' || b == b'\t');
+        match first {
+            b'>' => true,
+            b'-' | b'*' | b'+' if space_or_end(1) => true,
+            b'-' | b'*' | b'_' => crate::utils::thematic_break::is_thematic_break(text),
+            b'0'..=b'9' => {
+                let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+                digits <= 9 && matches!(bytes.get(digits), Some(b'.' | b')')) && space_or_end(digits + 1)
+            }
+            b'#' => {
+                let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
+                hashes <= 6 && bytes.get(hashes).is_none_or(|&b| b == b' ')
+            }
+            b'`' | b'~' | b':' => bytes.iter().take_while(|&&b| b == first).count() >= 3,
+            b'<' => {
+                crate::utils::html_block::opens_untagged_html_block(text)
+                    || crate::utils::html_block::parse_html_block_start(text).is_some_and(|(tag, _)| {
+                        !crate::utils::html_block::NON_SPEC_BLOCK_ELEMENTS.contains(&tag.as_str())
+                    })
+            }
+            b'[' => text
+                .strip_prefix("[^")
+                .and_then(|rest| rest.split_once("]:"))
+                .is_some_and(|(label, _)| {
+                    !label.is_empty() && !label.contains(|c: char| c.is_whitespace() || c == ']')
+                }),
+            _ => false,
+        }
+    }
+
+    /// Strip list continuation indentation from a line.
+    /// For lines that are continuations of a list item's content, strip the expected indent.
+    fn strip_list_continuation_indent(line: &str, expected_indent: usize) -> &str {
+        let bytes = line.as_bytes();
+        let mut spaces = 0;
+
+        for &b in bytes {
+            if b == b' ' {
+                spaces += 1;
+            } else if b == b'\t' {
+                // Tab counts as up to 4 spaces, rounding up to next multiple of 4
+                spaces = (spaces / 4 + 1) * 4;
+            } else {
+                break;
+            }
+
+            if spaces >= expected_indent {
+                break;
+            }
+        }
+
+        // Strip at most expected_indent characters
+        let strip_count = spaces.min(expected_indent).min(line.len());
+        // Count actual bytes to strip (handling tabs)
+        let mut byte_count = 0;
+        let mut counted_spaces = 0;
+        for &b in bytes {
+            if counted_spaces >= strip_count {
+                break;
+            }
+            if b == b' ' {
+                counted_spaces += 1;
+                byte_count += 1;
+            } else if b == b'\t' {
+                counted_spaces = (counted_spaces / 4 + 1) * 4;
+                byte_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        &line[byte_count..]
+    }
+
+    /// Find all table blocks in the content with optimized detection
+    /// This is a backward-compatible wrapper that accepts LintContext
+    pub fn find_table_blocks(content: &str, ctx: &crate::lint_context::LintContext) -> Vec<TableBlock> {
+        Self::find_table_blocks_with_code_info(
+            content,
+            &ctx.code_blocks,
+            &ctx.code_spans(),
+            ctx.html_comment_ranges(),
+            ctx.flavor,
+            &[],
+        )
+    }
+
+    /// Count the number of cells in a table row
+    pub fn count_cells(row: &str) -> usize {
+        Self::count_cells_with_flavor(row, crate::config::MarkdownFlavor::Standard)
+    }
+
+    /// Count the number of cells in a table row with flavor-specific behavior
+    ///
+    /// Pipes inside code spans are treated as content, not cell delimiters.
+    ///
+    /// This function strips blockquote prefixes before counting cells, so it works
+    /// correctly for tables inside blockquotes.
+    pub fn count_cells_with_flavor(row: &str, flavor: crate::config::MarkdownFlavor) -> usize {
+        // Strip blockquote prefix if present before counting cells
+        let (_, content) = Self::extract_blockquote_prefix(row);
+        Self::split_table_row_with_flavor(content, flavor).len()
+    }
+
+    /// Count the number of consecutive backslashes immediately preceding `pos` in `chars`.
+    fn count_preceding_backslashes(chars: &[char], pos: usize) -> usize {
+        let mut count = 0;
+        let mut k = pos;
+        while k > 0 {
+            k -= 1;
+            if chars[k] == '\\' {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+
+    /// Locate the inline code spans in `chars` as half-open char ranges covering
+    /// the opening delimiter, the content and the closing delimiter.
+    ///
+    /// Backticks preceded by an odd number of backslashes are escaped (literal text)
+    /// and do not open or close code spans. An even number of backslashes means the
+    /// backslashes themselves are escaped, so the backtick is a real delimiter. A run
+    /// of backticks with no matching closing run of the same length is literal text,
+    /// and scanning resumes just after it.
+    ///
+    /// This is the single definition of a code span for table parsing: both pipe
+    /// masking and wikilink detection read it, so they cannot disagree about where
+    /// code starts and ends.
+    fn inline_code_spans(chars: &[char]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut i = 0;
+
+        while i < chars.len() {
+            if chars[i] != '`' {
+                i += 1;
+                continue;
+            }
+
+            // A backtick preceded by an odd number of backslashes is escaped
+            if Self::count_preceding_backslashes(chars, i) % 2 != 0 {
+                i += 1;
+                continue;
+            }
+
+            // Count consecutive backticks at start
+            let start = i;
+            let mut backtick_count = 0;
+            while i < chars.len() && chars[i] == '`' {
+                backtick_count += 1;
+                i += 1;
+            }
+
+            // Look for a closing run of exactly the same length. Per CommonMark,
+            // backslash escapes do NOT work inside code spans -- all characters
+            // including backslashes are literal -- so no escape check applies here.
+            let mut j = i;
+            while j < chars.len() {
+                if chars[j] == '`' {
+                    let mut close_count = 0;
+                    while j < chars.len() && chars[j] == '`' {
+                        close_count += 1;
+                        j += 1;
+                    }
+
+                    if close_count == backtick_count {
+                        spans.push((start, j));
+                        i = j;
+                        break;
+                    }
+                    // Run of a different length: keep searching (j is already past it)
+                } else {
+                    j += 1;
+                }
+            }
+            // With no matching closing run the opener is literal text; `i` already
+            // sits just past it, so a later backtick can still open a span.
+        }
+
+        spans
+    }
+
+    /// Mask pipes inside inline code blocks with a placeholder character.
+    ///
+    /// The mask is the same byte width as what it replaces, so offsets into the
+    /// masked string still address the original text.
+    pub fn mask_pipes_in_inline_code(text: &str) -> String {
+        if !text.contains('`') {
+            return text.to_string();
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        let spans = Self::inline_code_spans(&chars);
+        if spans.is_empty() {
+            return text.to_string();
+        }
+
+        let mut result = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (start, end) in spans {
+            result.extend(chars[cursor..start].iter());
+            // The delimiters are backticks, so masking every pipe across the whole
+            // span leaves them untouched and only rewrites the content.
+            for &ch in &chars[start..end] {
+                result.push(if ch == '|' { '_' } else { ch });
+            }
+            cursor = end;
+        }
+        result.extend(chars[cursor..].iter());
+
+        result
+    }
+
+    /// Mask pipes inside wikilink aliases for accurate table cell parsing
+    ///
+    /// In Obsidian, `[[Target|Label]]` renders `Label` as a link to `Target`, so
+    /// the pipe separates the two halves of one link rather than two table cells.
+    /// Only a pipe between `[[` and a closing `]]` on the same line is masked.
+    ///
+    /// Two shapes are deliberately left as prose, because reading them as a link
+    /// would merge cells in a table that is already well formed and so would report
+    /// a column-count mismatch against a document that has none:
+    ///
+    /// - Brackets inside an inline code span. Code binds tighter than links, so
+    ///   ``` `[[` | mid | `]]` ``` is three cells of prose, not one cell with a link.
+    /// - A blank link target. `[[ | ]]` and `[[|Label]]` name no note, so the
+    ///   brackets are prose that happens to straddle a cell divider.
+    ///
+    /// The mask is the same byte width as what it replaces, so offsets into the
+    /// masked string still address the original text.
+    pub fn mask_pipes_in_wikilinks(text: &str) -> String {
+        // Without both halves of an opener and a pipe to hide there is nothing to do,
+        // and this runs over every line of an Obsidian document.
+        if !text.contains("[[") || !text.contains('|') {
+            return text.to_string();
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        let code_spans = Self::inline_code_spans(&chars);
+        let code_span_at = |pos: usize| code_spans.iter().find(|&&(s, e)| pos >= s && pos < e).copied();
+
+        let mut result = String::with_capacity(text.len());
+        let mut i = 0;
+
+        while i < chars.len() {
+            // Copy a code span through untouched; nothing inside it is link syntax.
+            if let Some((_, end)) = code_span_at(i) {
+                result.extend(chars[i..end].iter());
+                i = end;
+                continue;
+            }
+
+            if chars[i] == '['
+                && i + 1 < chars.len()
+                && chars[i + 1] == '['
+                && let Some(close) = Self::wikilink_close(&chars, &code_spans, i)
+            {
+                result.push_str("[[");
+                for &ch in &chars[i + 2..close] {
+                    if ch == '|' {
+                        result.push('_'); // Mask pipe with underscore
+                    } else {
+                        result.push(ch);
+                    }
+                }
+                result.push_str("]]");
+                i = close + 2;
+                continue;
+            }
+
+            result.push(chars[i]);
+            i += 1;
+        }
+
+        result
+    }
+
+    /// Find the `]]` closing the wikilink opened by the `[[` at `open`, or `None`
+    /// when the brackets do not delimit one.
+    ///
+    /// `code_spans` are the ranges from [`Self::inline_code_spans`]; brackets and
+    /// pipes inside one are content, so the scan steps over them whole.
+    fn wikilink_close(chars: &[char], code_spans: &[(usize, usize)], open: usize) -> Option<usize> {
+        let mut j = open + 2;
+        let mut first_pipe = None;
+
+        while j + 1 < chars.len() {
+            if let Some(&(_, end)) = code_spans.iter().find(|&&(s, _)| s == j) {
+                j = end;
+                continue;
+            }
+
+            if chars[j] == ']' && chars[j + 1] == ']' {
+                // The half before the pipe names the note the link points at, so a
+                // blank one means these brackets are prose that happens to straddle
+                // a cell divider rather than a link holding one.
+                if let Some(pipe) = first_pipe
+                    && chars[open + 2..pipe].iter().all(|c| c.is_whitespace())
+                {
+                    return None;
+                }
+                return Some(j);
+            }
+
+            // A wikilink does not span a nested "[["
+            if chars[j] == '[' && chars[j + 1] == '[' {
+                return None;
+            }
+
+            if chars[j] == '|' && first_pipe.is_none() {
+                first_pipe = Some(j);
+            }
+
+            j += 1;
+        }
+
+        None
+    }
+
+    /// Whether the flavor's table engine pairs backslashes before it looks for an
+    /// escaped pipe.
+    ///
+    /// GitHub and pulldown-cmark treat every pipe that directly follows a backslash
+    /// as cell text, so `\\|` is one cell. Python-Markdown (MkDocs) discards a `\\`
+    /// pair first, which leaves the pipe a real separator.
+    pub(crate) fn pairs_backslashes(flavor: crate::config::MarkdownFlavor) -> bool {
+        flavor == crate::config::MarkdownFlavor::MkDocs
+    }
+
+    /// Mask escaped pipes for accurate table cell parsing
+    ///
+    /// Escape handling happens BEFORE cell boundary detection, and the flavor's
+    /// table engine decides which pipes it covers (see `pairs_backslashes`):
+    /// - `\|` masks the pipe in every flavor
+    /// - `\\|` masks it too, except where backslashes are paired: there it is an
+    ///   escaped backslash followed by a real delimiter
+    ///
+    /// The mask is the same byte width as what it replaces. This function only
+    /// handles escaped pipes. Pipes inside inline code spans are handled separately
+    /// by `mask_pipes_in_inline_code`.
+    pub fn mask_escaped_pipes(text: &str, flavor: crate::config::MarkdownFlavor) -> String {
+        let pairs = Self::pairs_backslashes(flavor);
+        let mut result = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        let mut previous = None;
+
+        while let Some(ch) = chars.next() {
+            if ch == '\\' && pairs && chars.peek() == Some(&'\\') {
+                // Escaped backslash: push both, so a pipe after them stays a delimiter
+                result.push_str("\\\\");
+                chars.next();
+                previous = None;
+                continue;
+            }
+            result.push(if ch == '|' && previous == Some('\\') { '_' } else { ch });
+            previous = Some(ch);
+        }
+
+        result
+    }
+
+    /// Split a table row into individual cell contents with flavor-specific behavior.
+    ///
+    /// Returns a Vec of cell content strings (not trimmed - preserves original spacing).
+    /// This is the foundation for both cell counting and cell content extraction.
+    ///
+    /// Pipes inside code spans are treated as content, not cell delimiters.
+    pub fn split_table_row_with_flavor(row: &str, flavor: crate::config::MarkdownFlavor) -> Vec<String> {
+        // GFM strips only spaces and tabs around a row; any other whitespace is a cell's text
+        let trimmed = row.trim_matches([' ', '\t', '\r']);
+
+        if !trimmed.contains('|') {
+            return Vec::new();
+        }
+
+        // First, mask escaped pipes (which pipes an escape covers depends on the flavor)
+        let masked = Self::mask_escaped_pipes(trimmed, flavor);
+
+        // Mask pipes inside inline code for all flavors
+        let mut final_masked = Self::mask_pipes_in_inline_code(&masked);
+
+        // In Obsidian, a pipe inside [[Target|Label]] separates the link from its
+        // alias rather than one cell from the next
+        if flavor == crate::config::MarkdownFlavor::Obsidian {
+            final_masked = Self::mask_pipes_in_wikilinks(&final_masked);
+        }
+
+        let has_leading = final_masked.starts_with('|');
+        let has_trailing = final_masked.ends_with('|');
+
+        let mut masked_content = final_masked.as_str();
+        let mut orig_content = trimmed;
+
+        if has_leading {
+            masked_content = &masked_content[1..];
+            orig_content = &orig_content[1..];
+        }
+
+        // Track whether we actually strip a trailing pipe
+        let stripped_trailing = has_trailing && !masked_content.is_empty();
+        if stripped_trailing {
+            masked_content = &masked_content[..masked_content.len() - 1];
+            orig_content = &orig_content[..orig_content.len() - 1];
+        }
+
+        // Handle edge cases for degenerate inputs
+        if masked_content.is_empty() {
+            if stripped_trailing {
+                // "||" case: two pipes with empty content between = one empty cell
+                return vec![String::new()];
+            } else {
+                // "|" case: single pipe, not a valid table row
+                return Vec::new();
+            }
+        }
+
+        let masked_parts: Vec<&str> = masked_content.split('|').collect();
+        let mut cells = Vec::new();
+        let mut pos = 0;
+
+        for masked_cell in masked_parts {
+            let cell_len = masked_cell.len();
+            let orig_cell = if pos + cell_len <= orig_content.len() {
+                &orig_content[pos..pos + cell_len]
+            } else {
+                masked_cell
+            };
+            cells.push(orig_cell.to_string());
+            pos += cell_len + 1; // +1 for the pipe delimiter
+        }
+
+        cells
+    }
+
+    /// Split a table row into individual cell contents using Standard/GFM behavior.
+    pub fn split_table_row(row: &str) -> Vec<String> {
+        Self::split_table_row_with_flavor(row, crate::config::MarkdownFlavor::Standard)
+    }
+
+    /// Whether a row ends in a delimiter rather than an escaped cell-content pipe.
+    pub(crate) fn has_unescaped_trailing_pipe(line: &str, flavor: crate::config::MarkdownFlavor) -> bool {
+        let bytes = line.trim_end_matches([' ', '\t', '\r']).as_bytes();
+        if bytes.last() != Some(&b'|') {
+            return false;
+        }
+        let backslashes = bytes[..bytes.len() - 1]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count();
+        if Self::pairs_backslashes(flavor) {
+            backslashes % 2 == 0
+        } else {
+            backslashes == 0
+        }
+    }
+
+    /// Determine the pipe style of a table row
+    ///
+    /// Handles tables inside blockquotes by stripping the blockquote prefix
+    /// before analyzing the pipe style.
+    pub fn determine_pipe_style(line: &str) -> Option<&'static str> {
+        Self::determine_pipe_style_with_flavor(line, crate::config::MarkdownFlavor::Standard)
+    }
+
+    /// Flavor-aware form of [`Self::determine_pipe_style`]: the flavor decides whether
+    /// a pipe after a backslash pair closes the row.
+    pub fn determine_pipe_style_with_flavor(line: &str, flavor: crate::config::MarkdownFlavor) -> Option<&'static str> {
+        // Strip blockquote prefix if present before analyzing pipe style
+        let content = strip_blockquote_prefix(line);
+        let trimmed = content.trim_matches([' ', '\t', '\r']);
+        if !trimmed.contains('|') {
+            return None;
+        }
+
+        let has_leading = trimmed.starts_with('|');
+        let has_trailing = Self::has_unescaped_trailing_pipe(trimmed, flavor);
+
+        match (has_leading, has_trailing) {
+            (true, true) => Some("leading_and_trailing"),
+            (true, false) => Some("leading_only"),
+            (false, true) => Some("trailing_only"),
+            (false, false) => Some("no_leading_or_trailing"),
+        }
+    }
+
+    /// Extract blockquote prefix from a line, returning (prefix, content).
+    ///
+    /// This is useful for stripping the prefix before processing, then restoring it after.
+    /// For example: `"> | H1 | H2 |"` returns `("> ", "| H1 | H2 |")`.
+    pub fn extract_blockquote_prefix(line: &str) -> (&str, &str) {
+        // Find where the actual content starts (after blockquote markers and spaces)
+        let bytes = line.as_bytes();
+        let mut pos = 0;
+
+        // Skip leading whitespace (indent before blockquote marker)
+        while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+            pos += 1;
+        }
+
+        // If no blockquote marker, return empty prefix
+        if pos >= bytes.len() || bytes[pos] != b'>' {
+            return ("", line);
+        }
+
+        // Skip all blockquote markers and spaces
+        while pos < bytes.len() {
+            if bytes[pos] == b'>' {
+                pos += 1;
+                // Skip optional space after >
+                if pos < bytes.len() && bytes[pos] == b' ' {
+                    pos += 1;
+                }
+            } else if bytes[pos] == b' ' || bytes[pos] == b'\t' {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Split at the position where content starts
+        (&line[..pos], &line[pos..])
+    }
+
+    /// Like [`Self::extract_list_prefix`], but reads every list marker that opens
+    /// on the line (`- - x`, `1. - x`). Returns the whole marker prefix, the text
+    /// after it, the content column of the innermost item, and the content column
+    /// of each item the line opens, outermost first.
+    fn extract_nested_list_prefix(line: &str) -> (&str, &str, usize, Vec<usize>) {
+        let mut offset = 0;
+        let mut levels = Vec::new();
+        let mut column = 0;
+        let mut content_column = 0;
+        loop {
+            let rest = &line[offset..];
+            // `- - -` is a thematic break, not nested empty items, and `- * * *` is
+            // one item holding a break.
+            if crate::utils::thematic_break::is_thematic_break(rest) {
+                break;
+            }
+            let (prefix, content, indent) = Self::extract_list_prefix(rest);
+            if prefix.is_empty() {
+                break;
+            }
+            content_column = column + indent;
+            levels.push(content_column);
+            column = content_column;
+            offset += prefix.len();
+            if content.trim().is_empty() {
+                break;
+            }
+        }
+        (&line[..offset], &line[offset..], content_column, levels)
+    }
+
+    /// Extract list marker prefix from a line, returning (prefix, content, content_indent).
+    ///
+    /// This handles unordered list markers (`-`, `*`, `+`) and ordered list markers (`1.`, `10)`, etc.)
+    /// Returns:
+    /// - prefix: The list marker including any leading whitespace and trailing space (e.g., "- ", "  1. ")
+    /// - content: The content after the list marker
+    /// - content_indent: The number of spaces needed for continuation lines to align with content
+    ///
+    /// For example:
+    /// - `"- | H1 | H2 |"` returns `("- ", "| H1 | H2 |", 2)`
+    /// - `"1. | H1 | H2 |"` returns `("1. ", "| H1 | H2 |", 3)`
+    /// - `"  - table"` returns `("  - ", "table", 4)`
+    ///
+    /// Returns `("", line, 0)` if the line doesn't start with a list marker.
+    pub fn extract_list_prefix(line: &str) -> (&str, &str, usize) {
+        let bytes = line.as_bytes();
+
+        // Skip leading whitespace
+        let leading_spaces = bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        let mut pos = leading_spaces;
+
+        if pos >= bytes.len() {
+            return ("", line, 0);
+        }
+
+        // Check for unordered list marker: -, *, +
+        if matches!(bytes[pos], b'-' | b'*' | b'+') {
+            pos += 1;
+
+            // Must be followed by space or tab (or end of line for marker-only lines)
+            if pos >= bytes.len() || bytes[pos] == b' ' || bytes[pos] == b'\t' {
+                let marker_end = pos;
+                // Skip the space after marker if present
+                if pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+                    pos += 1;
+                }
+                let content_indent = Self::content_indent(line, marker_end);
+                return (&line[..pos], &line[pos..], content_indent);
+            }
+            // Not a list marker (e.g., "-word" or "--")
+            return ("", line, 0);
+        }
+
+        // Check for ordered list marker: digits followed by . or ) then space
+        if bytes[pos].is_ascii_digit() {
+            let digit_start = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+
+            // Must have at least one digit
+            if pos > digit_start && pos < bytes.len() {
+                // Check for . or ) followed by space/tab
+                if bytes[pos] == b'.' || bytes[pos] == b')' {
+                    pos += 1;
+                    if pos >= bytes.len() || bytes[pos] == b' ' || bytes[pos] == b'\t' {
+                        let marker_end = pos;
+                        // Skip the space after marker if present
+                        if pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+                            pos += 1;
+                        }
+                        let content_indent = Self::content_indent(line, marker_end);
+                        return (&line[..pos], &line[pos..], content_indent);
+                    }
+                }
+            }
+        }
+
+        ("", line, 0)
+    }
+
+    /// Column where an item's content starts: after the marker and the one to four
+    /// columns of whitespace following it, or one column past the marker when the
+    /// item opens with a blank line. Tabs advance to the next multiple of four.
+    fn content_indent(line: &str, marker_end: usize) -> usize {
+        let advance = |column: usize, byte: u8| match byte {
+            b'\t' => (column / 4 + 1) * 4,
+            _ => column + 1,
+        };
+        let marker_column = line.as_bytes()[..marker_end]
+            .iter()
+            .fold(0, |column, &b| advance(column, b));
+        let rest = &line[marker_end..];
+        if rest.trim().is_empty() {
+            return marker_column + 1;
+        }
+        let content_column = rest
+            .bytes()
+            .take_while(|&b| b == b' ' || b == b'\t')
+            .fold(marker_column, advance);
+        match content_column - marker_column {
+            1..=4 => content_column,
+            // Five or more columns make the content indented code, leaving one.
+            _ => marker_column + 1,
+        }
+    }
+
+    /// Extract the table row content from a line, stripping any list/blockquote prefix.
+    ///
+    /// This is useful for processing table rows that may be inside list items or blockquotes.
+    /// The line_index indicates which line of the table this is (0 = header, 1 = delimiter, etc.)
+    pub fn extract_table_row_content<'a>(line: &'a str, table_block: &TableBlock, line_index: usize) -> &'a str {
+        // First strip blockquote prefix
+        let (_, after_blockquote) = Self::extract_blockquote_prefix(line);
+
+        // Then handle list prefix if present
+        if let Some(ref list_ctx) = table_block.list_context {
+            if line_index == 0 {
+                // Header line: strip list prefix (handles both markers and indentation)
+                after_blockquote
+                    .strip_prefix(&list_ctx.list_prefix)
+                    .unwrap_or_else(|| Self::extract_list_prefix(after_blockquote).1)
+            } else {
+                // Continuation lines: strip indentation
+                Self::strip_list_continuation_indent(after_blockquote, list_ctx.content_indent)
+            }
+        } else if line_index == 0 {
+            // A header opening after list markers (`- > |a|b|`) has no list
+            // context, since its rows carry the quote marker and not the item's
+            // indentation, so the markers are stripped here.
+            &line[table_block
+                .header_prefix_len
+                .unwrap_or_else(|| header_container_prefix_len(line, 0, &[]))..]
+        } else {
+            after_blockquote
+        }
+    }
+
+    /// The text in front of a table row that belongs to its containers: the part
+    /// of `line` that `extract_table_row_content` strips. A rewrite puts it back
+    /// unchanged, so a row stays in the container it was written in.
+    pub fn row_prefix<'a>(line: &'a str, header: &str, table_block: &TableBlock, line_index: usize) -> &'a str {
+        let content = Self::extract_table_row_content(line, table_block, line_index);
+        let prefix = &line[..line.len() - content.len()];
+        let header_has_markers = Self::extract_table_row_content(header, table_block, 0).len() < header.len();
+        if prefix.is_empty() && (header_has_markers || Self::is_container_indented(header, table_block)) {
+            // A continuation row of an item whose header carries list markers has
+            // only its indentation to restore (a tab after the marker is not stripped).
+            // So does a row of a table inside an indented container (an admonition,
+            // a content tab), whose indentation is what keeps it in that container.
+            &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+        } else {
+            prefix
+        }
+    }
+
+    /// The table sits in a container that is written as indentation (an admonition,
+    /// a content tab, a Markdown-enabled `div`): outside any list item, its header
+    /// starts four or more columns in, which is only a table there and not indented
+    /// code. Its rows must keep their indentation to stay in the container.
+    pub fn is_container_indented(header: &str, table_block: &TableBlock) -> bool {
+        if table_block.list_context.is_some() {
+            return false;
+        }
+        let columns = header
+            .bytes()
+            .take_while(|&byte| byte == b' ' || byte == b'\t')
+            .fold(0, |column, byte| {
+                if byte == b'\t' {
+                    (column / 4 + 1) * 4
+                } else {
+                    column + 1
+                }
+            });
+        columns >= 4
+    }
+
+    /// The header row is written four or more columns inside its container while
+    /// the delimiter row is not, so it is a table only as the continuation of the
+    /// paragraph above it. Moving the other rows to its indentation, or putting a
+    /// blank line before it, leaves indented code.
+    pub fn header_is_indented_as_code(header: &str, delimiter: &str, table_block: &TableBlock) -> bool {
+        let columns = |text: &str| -> usize {
+            text.bytes()
+                .take_while(|&byte| byte == b' ' || byte == b'\t')
+                .fold(0, |column, byte| {
+                    if byte == b'\t' {
+                        (column / 4 + 1) * 4
+                    } else {
+                        column + 1
+                    }
+                })
+        };
+        let list_indent = table_block.list_context.as_ref().map_or(0, |list| list.content_indent);
+        let inside_container = |line: &str| {
+            let text = parse_blockquote_prefix(line).map_or(line, |quote| quote.content);
+            columns(text).saturating_sub(list_indent)
+        };
+        inside_container(header) >= 4 && inside_container(delimiter) < 4
+    }
+
+    /// Check if the content after a list marker looks like a table row.
+    /// This is used to detect tables that start on the same line as a list marker.
+    pub fn is_list_item_with_table_row(line: &str, flavor: crate::config::MarkdownFlavor) -> bool {
+        let (prefix, content, _) = Self::extract_list_prefix(line);
+        if prefix.is_empty() {
+            return false;
+        }
+
+        // Check if the content after the list marker is a table row
+        // It must start with | (proper table format within a list)
+        let trimmed = content.trim();
+        if !trimmed.starts_with('|') {
+            return false;
+        }
+
+        // Use our table row detection on the content
+        Self::is_potential_table_row_content(content, flavor)
+    }
+
+    /// Internal helper: Check if content (without list/blockquote prefix) looks like a table row.
+    fn is_potential_table_row_content(content: &str, flavor: crate::config::MarkdownFlavor) -> bool {
+        Self::is_potential_table_row_with_flavor(content, flavor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_bare_list_marker_content_starts_one_column_past_the_marker() {
+        assert_eq!(TableUtils::extract_list_prefix("-"), ("-", "", 2));
+        assert_eq!(TableUtils::extract_list_prefix("1."), ("1.", "", 3));
+        assert_eq!(TableUtils::extract_list_prefix("  - "), ("  - ", "", 4));
+        assert_eq!(TableUtils::extract_list_prefix("- x"), ("- ", "x", 2));
+        assert_eq!(TableUtils::extract_list_prefix("10. x"), ("10. ", "x", 4));
+    }
+
+    #[test]
+    fn test_list_content_starts_after_up_to_four_spaces_following_the_marker() {
+        assert_eq!(TableUtils::extract_list_prefix("-   x").2, 4);
+        assert_eq!(TableUtils::extract_list_prefix("1.  x").2, 4);
+        assert_eq!(TableUtils::extract_list_prefix("-    x").2, 5);
+        // Five or more spaces make the content indented code: one space belongs to the marker.
+        assert_eq!(TableUtils::extract_list_prefix("-     x").2, 2);
+        assert_eq!(TableUtils::extract_list_prefix("  -   x").2, 6);
+        assert_eq!(TableUtils::extract_list_prefix("-\tx").2, 4);
+        assert_eq!(TableUtils::extract_list_prefix("1.\tx").2, 4);
+        assert_eq!(TableUtils::extract_list_prefix("10.\tx").2, 4);
+    }
+
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn context_table_layout_preserves_mixed_terminator_offsets() {
+        // UTF-8 and CRLF before a fence must not shift the later header into
+        // that fence's byte range. A lone CR is content, not a line ending.
+        for newline in ["\n", "\r\n"] {
+            let source = format!(
+                "é🦀\r\n\n```md{newline}| hidden |{newline}| --- |{newline}```{newline}\n\
+                 > | a | b |\r\n> | --- | --- |\n> | x\r | y |\r\n"
+            );
+            let ctx = LintContext::new(&source, crate::config::MarkdownFlavor::Standard, None);
+            assert_eq!(ctx.table_blocks.len(), 1, "{source:?}");
+            let table = &ctx.table_blocks[0];
+            assert_eq!((table.header_line, table.delimiter_line, table.end_line), (7, 8, 9));
+            assert_eq!(table.content_lines, vec![9]);
+        }
+    }
+
+    #[test]
+    fn test_is_potential_table_row() {
+        // Basic valid table rows
+        assert!(TableUtils::is_potential_table_row("| Header 1 | Header 2 |"));
+        assert!(TableUtils::is_potential_table_row("| Cell 1 | Cell 2 |"));
+        assert!(TableUtils::is_potential_table_row("Cell 1 | Cell 2"));
+        assert!(TableUtils::is_potential_table_row("| Cell |")); // Single-column tables are valid in GFM
+
+        // Multiple cells
+        assert!(TableUtils::is_potential_table_row("| A | B | C | D | E |"));
+
+        // With whitespace
+        assert!(TableUtils::is_potential_table_row("  | Indented | Table |  "));
+        assert!(TableUtils::is_potential_table_row("| Spaces | Around |"));
+
+        // Not table rows
+        assert!(!TableUtils::is_potential_table_row("- List item"));
+        assert!(!TableUtils::is_potential_table_row("* Another list"));
+        assert!(!TableUtils::is_potential_table_row("+ Plus list"));
+        assert!(!TableUtils::is_potential_table_row("Regular text"));
+        assert!(!TableUtils::is_potential_table_row(""));
+        assert!(!TableUtils::is_potential_table_row("   "));
+
+        // Code blocks
+        assert!(!TableUtils::is_potential_table_row("`code with | pipe`"));
+        assert!(!TableUtils::is_potential_table_row("``multiple | backticks``"));
+        assert!(!TableUtils::is_potential_table_row("Use ``a|b`` in prose"));
+        assert!(TableUtils::is_potential_table_row("| `fenced` | Uses ``` and ~~~ |"));
+        assert!(TableUtils::is_potential_table_row("`!foo && bar` | `(!foo) && bar`"));
+        assert!(!TableUtils::is_potential_table_row("`echo a | sed 's/a/b/'`"));
+
+        // Math spans: pipes inside $...$ are not table separators
+        assert!(!TableUtils::is_potential_table_row(
+            "Text with $|S|$ math notation here."
+        ));
+        assert!(!TableUtils::is_potential_table_row(
+            "Size $|S|$ was even, check $|T|$ too."
+        ));
+        assert!(!TableUtils::is_potential_table_row("Display $$|A| + |B|$$ math here."));
+        // Math pipe in cell with outer pipes is still a table row
+        assert!(TableUtils::is_potential_table_row("| cell with $|S|$ math |"));
+        // Pipe after fully closed math spans is still detected
+        assert!(TableUtils::is_potential_table_row("$a$ | $b$"));
+        assert!(TableUtils::is_potential_table_row("$f(x)$ and $g(x)$ | result"));
+        // $5 | $10 style price comparisons are suppressed as a deliberate trade-off:
+        // the leading $ opens a math span, consuming the pipe. Tables with bare dollar
+        // amounts should use outer pipes (| $5 | $10 |) to be correctly detected.
+        assert!(!TableUtils::is_potential_table_row("$5 | $10"));
+
+        // Single pipe not enough
+        assert!(!TableUtils::is_potential_table_row("Just one |"));
+        assert!(!TableUtils::is_potential_table_row("| Just one"));
+
+        // Very long cells are valid in tables (no length limit for cell content)
+        let long_cell = "a".repeat(150);
+        assert!(TableUtils::is_potential_table_row(&format!("| {long_cell} | b |")));
+
+        // Cells with newlines
+        assert!(!TableUtils::is_potential_table_row("| Cell with\nnewline | Other |"));
+
+        // Empty cells (Issue #129)
+        assert!(TableUtils::is_potential_table_row("|||")); // Two empty cells
+        assert!(TableUtils::is_potential_table_row("||||")); // Three empty cells
+        assert!(TableUtils::is_potential_table_row("| | |")); // Two empty cells with spaces
+    }
+
+    #[test]
+    fn test_list_items_with_pipes_not_table_rows() {
+        // Ordered list items should NOT be detected as table rows
+        assert!(!TableUtils::is_potential_table_row("1. Item with | pipe"));
+        assert!(!TableUtils::is_potential_table_row("10. Item with | pipe"));
+        assert!(!TableUtils::is_potential_table_row("999. Item with | pipe"));
+        assert!(!TableUtils::is_potential_table_row("1) Item with | pipe"));
+        assert!(!TableUtils::is_potential_table_row("10) Item with | pipe"));
+
+        // Unordered list items with tabs
+        assert!(!TableUtils::is_potential_table_row("-\tItem with | pipe"));
+        assert!(!TableUtils::is_potential_table_row("*\tItem with | pipe"));
+        assert!(!TableUtils::is_potential_table_row("+\tItem with | pipe"));
+
+        // Indented list items (the trim_start normalizes indentation)
+        assert!(!TableUtils::is_potential_table_row("  - Indented | pipe"));
+        assert!(!TableUtils::is_potential_table_row("    * Deep indent | pipe"));
+        assert!(!TableUtils::is_potential_table_row("  1. Ordered indent | pipe"));
+
+        // Task list items
+        assert!(!TableUtils::is_potential_table_row("- [ ] task | pipe"));
+        assert!(!TableUtils::is_potential_table_row("- [x] done | pipe"));
+
+        // Multiple pipes in list items
+        assert!(!TableUtils::is_potential_table_row("1. foo | bar | baz"));
+        assert!(!TableUtils::is_potential_table_row("- alpha | beta | gamma"));
+
+        // These SHOULD still be detected as potential table rows
+        assert!(TableUtils::is_potential_table_row("| cell | cell |"));
+        assert!(TableUtils::is_potential_table_row("cell | cell"));
+        assert!(TableUtils::is_potential_table_row("| Header | Header |"));
+    }
+
+    #[test]
+    fn test_atx_headings_with_pipes_not_table_rows() {
+        // All 6 ATX heading levels with pipes
+        assert!(!TableUtils::is_potential_table_row("# Heading | with pipe"));
+        assert!(!TableUtils::is_potential_table_row("## Heading | with pipe"));
+        assert!(!TableUtils::is_potential_table_row("### Heading | with pipe"));
+        assert!(!TableUtils::is_potential_table_row("#### Heading | with pipe"));
+        assert!(!TableUtils::is_potential_table_row("##### Heading | with pipe"));
+        assert!(!TableUtils::is_potential_table_row("###### Heading | with pipe"));
+
+        // Multiple pipes in headings
+        assert!(!TableUtils::is_potential_table_row("### col1 | col2 | col3"));
+        assert!(!TableUtils::is_potential_table_row("## a|b|c"));
+
+        // Headings with tab after hashes
+        assert!(!TableUtils::is_potential_table_row("#\tHeading | pipe"));
+        assert!(!TableUtils::is_potential_table_row("##\tHeading | pipe"));
+
+        // Heading with only hashes and pipe (empty heading text)
+        assert!(!TableUtils::is_potential_table_row("# |"));
+        assert!(!TableUtils::is_potential_table_row("## |"));
+
+        // Indented headings (spaces before #)
+        assert!(!TableUtils::is_potential_table_row("  ## Heading | pipe"));
+        assert!(!TableUtils::is_potential_table_row("   ### Heading | pipe"));
+
+        // Unicode content in headings (the original proptest failure case)
+        assert!(!TableUtils::is_potential_table_row("#### ®aAA|ᯗ"));
+
+        // 7+ hashes are NOT headings — should follow normal table detection
+        // "####### text|pipe" has no space after 7 hashes if treated as non-heading
+        // but with a space it still has 7+ hashes so not a heading
+        assert!(TableUtils::is_potential_table_row("####### text | pipe"));
+
+        // Hash without space is NOT a heading, so pipe detection applies
+        assert!(TableUtils::is_potential_table_row("#nospc|pipe"));
+
+        // These SHOULD still be detected as potential table rows
+        assert!(TableUtils::is_potential_table_row("| # Header | Value |"));
+        assert!(TableUtils::is_potential_table_row("text | #tag"));
+    }
+
+    #[test]
+    fn test_is_delimiter_row() {
+        // Basic delimiter rows
+        assert!(TableUtils::is_delimiter_row("|---|---|"));
+        assert!(TableUtils::is_delimiter_row("| --- | --- |"));
+        assert!(TableUtils::is_delimiter_row("|:---|---:|"));
+        assert!(TableUtils::is_delimiter_row("|:---:|:---:|"));
+
+        // With varying dash counts
+        assert!(TableUtils::is_delimiter_row("|-|--|"));
+        assert!(TableUtils::is_delimiter_row("|-------|----------|"));
+
+        // With whitespace
+        assert!(TableUtils::is_delimiter_row("|  ---  |  ---  |"));
+        assert!(TableUtils::is_delimiter_row("| :--- | ---: |"));
+
+        // Multiple columns
+        assert!(TableUtils::is_delimiter_row("|---|---|---|---|"));
+
+        // Without leading/trailing pipes
+        assert!(TableUtils::is_delimiter_row("--- | ---"));
+        assert!(TableUtils::is_delimiter_row(":--- | ---:"));
+
+        // Not delimiter rows
+        assert!(!TableUtils::is_delimiter_row("| Header | Header |"));
+        assert!(!TableUtils::is_delimiter_row("Regular text"));
+        assert!(!TableUtils::is_delimiter_row(""));
+        assert!(!TableUtils::is_delimiter_row("|||"));
+        assert!(!TableUtils::is_delimiter_row("| | |"));
+
+        // Must have dashes
+        assert!(!TableUtils::is_delimiter_row("| : | : |"));
+        assert!(!TableUtils::is_delimiter_row("|    |    |"));
+
+        // Mixed content
+        assert!(!TableUtils::is_delimiter_row("| --- | text |"));
+        assert!(!TableUtils::is_delimiter_row("| abc | --- |"));
+    }
+
+    #[test]
+    fn test_count_cells() {
+        // Basic counts
+        assert_eq!(TableUtils::count_cells("| Cell 1 | Cell 2 | Cell 3 |"), 3);
+        assert_eq!(TableUtils::count_cells("Cell 1 | Cell 2 | Cell 3"), 3);
+        assert_eq!(TableUtils::count_cells("| Cell 1 | Cell 2"), 2);
+        assert_eq!(TableUtils::count_cells("Cell 1 | Cell 2 |"), 2);
+
+        // Single cell
+        assert_eq!(TableUtils::count_cells("| Cell |"), 1);
+        assert_eq!(TableUtils::count_cells("Cell"), 0); // No pipe
+
+        // Empty cells
+        assert_eq!(TableUtils::count_cells("|  |  |  |"), 3);
+        assert_eq!(TableUtils::count_cells("| | | |"), 3);
+
+        // Many cells
+        assert_eq!(TableUtils::count_cells("| A | B | C | D | E | F |"), 6);
+
+        // Edge cases
+        assert_eq!(TableUtils::count_cells("||"), 1); // One empty cell
+        assert_eq!(TableUtils::count_cells("|||"), 2); // Two empty cells
+
+        // No table
+        assert_eq!(TableUtils::count_cells("Regular text"), 0);
+        assert_eq!(TableUtils::count_cells(""), 0);
+        assert_eq!(TableUtils::count_cells("   "), 0);
+
+        // Whitespace handling
+        assert_eq!(TableUtils::count_cells("  | A | B |  "), 2);
+        assert_eq!(TableUtils::count_cells("|   A   |   B   |"), 2);
+    }
+
+    #[test]
+    fn test_count_cells_with_escaped_pipes() {
+        // Pipes inside code spans are treated as content, not cell delimiters.
+        // To include a literal pipe outside code spans, escape it with \|.
+
+        // Basic table structure
+        assert_eq!(TableUtils::count_cells("| Challenge | Solution |"), 2);
+        assert_eq!(TableUtils::count_cells("| A | B | C |"), 3);
+        assert_eq!(TableUtils::count_cells("| One | Two |"), 2);
+
+        // Escaped pipes: \| keeps the pipe as content
+        assert_eq!(TableUtils::count_cells(r"| Command | echo \| grep |"), 2);
+        assert_eq!(TableUtils::count_cells(r"| A | B \| C |"), 2); // B | C is one cell
+
+        // Escaped pipes inside backticks
+        assert_eq!(TableUtils::count_cells(r"| Command | `echo \| grep` |"), 2);
+
+        // GFM: any backslash directly before a pipe escapes it, whatever the parity
+        for backslashes in 1..=4 {
+            let row = format!("| A | B {}| C |", "\\".repeat(backslashes));
+            assert_eq!(TableUtils::count_cells(&row), 2, "{row}");
+        }
+        // Double backslash inside backticks: pipe is still masked by code span
+        assert_eq!(TableUtils::count_cells(r"| A | `B \\| C` |"), 2);
+
+        // Pipes inside code spans are content, not delimiters
+        assert_eq!(TableUtils::count_cells("| Command | `echo | grep` |"), 2);
+        assert_eq!(TableUtils::count_cells("| `code | one` | `code | two` |"), 2);
+        assert_eq!(TableUtils::count_cells("| `single|pipe` |"), 1);
+
+        // Regex example - pipes in code spans are masked
+        assert_eq!(TableUtils::count_cells(r"| Hour formats | `^([0-1]?\d|2[0-3])` |"), 2);
+        // Escaped pipe inside code is also masked (escape is redundant here)
+        assert_eq!(TableUtils::count_cells(r"| Hour formats | `^([0-1]?\d\|2[0-3])` |"), 2);
+    }
+
+    #[test]
+    fn test_determine_pipe_style() {
+        // All pipe styles
+        assert_eq!(
+            TableUtils::determine_pipe_style("| Cell 1 | Cell 2 |"),
+            Some("leading_and_trailing")
+        );
+        assert_eq!(
+            TableUtils::determine_pipe_style("| Cell 1 | Cell 2"),
+            Some("leading_only")
+        );
+        assert_eq!(
+            TableUtils::determine_pipe_style("Cell 1 | Cell 2 |"),
+            Some("trailing_only")
+        );
+        assert_eq!(
+            TableUtils::determine_pipe_style("Cell 1 | Cell 2"),
+            Some("no_leading_or_trailing")
+        );
+
+        // With whitespace
+        assert_eq!(
+            TableUtils::determine_pipe_style("  | Cell 1 | Cell 2 |  "),
+            Some("leading_and_trailing")
+        );
+        assert_eq!(
+            TableUtils::determine_pipe_style("  | Cell 1 | Cell 2  "),
+            Some("leading_only")
+        );
+
+        // No pipes
+        assert_eq!(TableUtils::determine_pipe_style("Regular text"), None);
+        assert_eq!(TableUtils::determine_pipe_style(""), None);
+        assert_eq!(TableUtils::determine_pipe_style("   "), None);
+
+        // Single pipe cases
+        assert_eq!(TableUtils::determine_pipe_style("|"), Some("leading_and_trailing"));
+        assert_eq!(TableUtils::determine_pipe_style("| Cell"), Some("leading_only"));
+        assert_eq!(TableUtils::determine_pipe_style("Cell |"), Some("trailing_only"));
+    }
+
+    #[test]
+    fn test_determine_pipe_style_distinguishes_escaped_cell_pipes() {
+        for backslashes in 0..=6 {
+            let row = format!("A | B {}|", "\\".repeat(backslashes));
+            let expected = if backslashes == 0 {
+                "trailing_only"
+            } else {
+                "no_leading_or_trailing"
+            };
+            for prefix in ["", "> ", ">> "] {
+                assert_eq!(
+                    TableUtils::determine_pipe_style(&format!("{prefix}{row}")),
+                    Some(expected)
+                );
+            }
+            // Python-Markdown discards backslash pairs first, so parity decides.
+            let mkdocs_expected = if backslashes % 2 == 0 {
+                "trailing_only"
+            } else {
+                "no_leading_or_trailing"
+            };
+            assert_eq!(
+                TableUtils::determine_pipe_style_with_flavor(&row, crate::config::MarkdownFlavor::MkDocs),
+                Some(mkdocs_expected)
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_table_blocks_simple() {
+        let content = "| Header 1 | Header 2 |
+|-----------|-----------|
+| Cell 1    | Cell 2    |
+| Cell 3    | Cell 4    |";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(tables.len(), 1);
+
+        let table = &tables[0];
+        assert_eq!(table.start_line, 0);
+        assert_eq!(table.end_line, 3);
+        assert_eq!(table.header_line, 0);
+        assert_eq!(table.delimiter_line, 1);
+        assert_eq!(table.content_lines, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_find_table_blocks_multiple() {
+        let content = "Some text
+
+| Table 1 | Col A |
+|----------|-------|
+| Data 1   | Val 1 |
+
+More text
+
+| Table 2 | Col 2 |
+|----------|-------|
+| Data 2   | Data  |";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(tables.len(), 2);
+
+        // First table
+        assert_eq!(tables[0].start_line, 2);
+        assert_eq!(tables[0].end_line, 4);
+        assert_eq!(tables[0].header_line, 2);
+        assert_eq!(tables[0].delimiter_line, 3);
+        assert_eq!(tables[0].content_lines, vec![4]);
+
+        // Second table
+        assert_eq!(tables[1].start_line, 8);
+        assert_eq!(tables[1].end_line, 10);
+        assert_eq!(tables[1].header_line, 8);
+        assert_eq!(tables[1].delimiter_line, 9);
+        assert_eq!(tables[1].content_lines, vec![10]);
+    }
+
+    #[test]
+    fn test_find_table_blocks_no_content_rows() {
+        let content = "| Header 1 | Header 2 |
+|-----------|-----------|
+
+Next paragraph";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(tables.len(), 1);
+
+        let table = &tables[0];
+        assert_eq!(table.start_line, 0);
+        assert_eq!(table.end_line, 1); // Just header and delimiter
+        assert_eq!(table.content_lines.len(), 0);
+    }
+
+    #[test]
+    fn test_find_table_blocks_in_code_block() {
+        let content = "```
+| Not | A | Table |
+|-----|---|-------|
+| In  | Code | Block |
+```
+
+| Real | Table |
+|------|-------|
+| Data | Here  |";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(tables.len(), 1); // Only the table outside code block
+
+        let table = &tables[0];
+        assert_eq!(table.header_line, 6);
+        assert_eq!(table.delimiter_line, 7);
+    }
+
+    #[test]
+    fn test_find_table_blocks_no_tables() {
+        let content = "Just regular text
+No tables here
+- List item with | pipe
+* Another list item";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(tables.len(), 0);
+    }
+
+    #[test]
+    fn test_find_table_blocks_malformed() {
+        let content = "| Header without delimiter |
+| This looks like table |
+But no delimiter row
+
+| Proper | Table |
+|---------|-------|
+| Data    | Here  |";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(tables.len(), 1); // Only the proper table
+        assert_eq!(tables[0].header_line, 4);
+    }
+
+    #[test]
+    fn test_find_table_blocks_keeps_obsidian_wikilink_prose_out_of_the_table() {
+        let content = "| A | B |\n| - | - |\n| x | y |\n[[Foo|bar]] is a note.\n";
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let blocks = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(blocks.len(), 1, "Expected one table, got {blocks:?}");
+        assert_eq!(
+            blocks[0].end_line, 2,
+            "Wikilink prose was absorbed into the table: {:?}",
+            blocks[0]
+        );
+        assert_eq!(blocks[0].content_lines, vec![2]);
+
+        // Control: under GFM the same pipe is a cell delimiter, so the line really
+        // is a table row and belongs to the block.
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let blocks = TableUtils::find_table_blocks(content, &ctx);
+        assert_eq!(blocks.len(), 1, "Expected one table, got {blocks:?}");
+        assert_eq!(
+            blocks[0].end_line, 3,
+            "GFM should still read the pipe as a delimiter: {:?}",
+            blocks[0]
+        );
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // Test empty content
+        assert!(!TableUtils::is_potential_table_row(""));
+        assert!(!TableUtils::is_delimiter_row(""));
+        assert_eq!(TableUtils::count_cells(""), 0);
+        assert_eq!(TableUtils::determine_pipe_style(""), None);
+
+        // Test whitespace only
+        assert!(!TableUtils::is_potential_table_row("   "));
+        assert!(!TableUtils::is_delimiter_row("   "));
+        assert_eq!(TableUtils::count_cells("   "), 0);
+        assert_eq!(TableUtils::determine_pipe_style("   "), None);
+
+        // Test single character
+        assert!(!TableUtils::is_potential_table_row("|"));
+        assert!(!TableUtils::is_delimiter_row("|"));
+        assert_eq!(TableUtils::count_cells("|"), 0); // Need at least 2 parts
+
+        // Test very long lines are valid table rows (no length limit)
+        // Test both single-column and multi-column long lines
+        let long_single = format!("| {} |", "a".repeat(200));
+        assert!(TableUtils::is_potential_table_row(&long_single)); // Single-column table with long content
+
+        let long_multi = format!("| {} | {} |", "a".repeat(200), "b".repeat(200));
+        assert!(TableUtils::is_potential_table_row(&long_multi)); // Multi-column table with long content
+
+        // Test unicode
+        assert!(TableUtils::is_potential_table_row("| 你好 | 世界 |"));
+        assert!(TableUtils::is_potential_table_row("| émoji | 🎉 |"));
+        assert_eq!(TableUtils::count_cells("| 你好 | 世界 |"), 2);
+    }
+
+    #[test]
+    fn test_table_block_struct() {
+        let block = TableBlock {
+            start_line: 0,
+            end_line: 5,
+            header_line: 0,
+            delimiter_line: 1,
+            content_lines: vec![2, 3, 4, 5],
+            list_context: None,
+            parser_confirmed: true,
+            repairable: false,
+            header_prefix_len: None,
+        };
+
+        // Test Debug trait
+        let debug_str = format!("{block:?}");
+        assert!(debug_str.contains("TableBlock"));
+        assert!(debug_str.contains("start_line: 0"));
+
+        // Test Clone trait
+        let cloned = block.clone();
+        assert_eq!(cloned.start_line, block.start_line);
+        assert_eq!(cloned.end_line, block.end_line);
+        assert_eq!(cloned.header_line, block.header_line);
+        assert_eq!(cloned.delimiter_line, block.delimiter_line);
+        assert_eq!(cloned.content_lines, block.content_lines);
+        assert!(cloned.list_context.is_none());
+    }
+
+    #[test]
+    fn test_split_table_row() {
+        // Basic split
+        let cells = TableUtils::split_table_row("| Cell 1 | Cell 2 | Cell 3 |");
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].trim(), "Cell 1");
+        assert_eq!(cells[1].trim(), "Cell 2");
+        assert_eq!(cells[2].trim(), "Cell 3");
+
+        // Without trailing pipe
+        let cells = TableUtils::split_table_row("| Cell 1 | Cell 2");
+        assert_eq!(cells.len(), 2);
+
+        // Empty cells
+        let cells = TableUtils::split_table_row("| | | |");
+        assert_eq!(cells.len(), 3);
+
+        // Single cell
+        let cells = TableUtils::split_table_row("| Cell |");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].trim(), "Cell");
+
+        // No pipes
+        let cells = TableUtils::split_table_row("No pipes here");
+        assert_eq!(cells.len(), 0);
+    }
+
+    #[test]
+    fn test_split_table_row_with_escaped_pipes() {
+        // Escaped pipes should be preserved in cell content
+        let cells = TableUtils::split_table_row(r"| A | B \| C |");
+        assert_eq!(cells.len(), 2);
+        assert!(cells[1].contains(r"\|"), "Escaped pipe should be in cell content");
+
+        // GFM: a backslash before a pipe escapes it whatever the parity
+        let cells = TableUtils::split_table_row(r"| A | B \\| C |");
+        assert_eq!(cells.len(), 2);
+    }
+
+    #[test]
+    fn test_split_table_row_with_flavor_mkdocs() {
+        // MkDocs flavor: pipes in inline code are NOT cell delimiters
+        let cells =
+            TableUtils::split_table_row_with_flavor("| Type | `x | y` |", crate::config::MarkdownFlavor::MkDocs);
+        assert_eq!(cells.len(), 2);
+        assert!(
+            cells[1].contains("`x | y`"),
+            "Inline code with pipe should be single cell in MkDocs flavor"
+        );
+
+        // Multiple pipes in inline code
+        let cells =
+            TableUtils::split_table_row_with_flavor("| Type | `a | b | c` |", crate::config::MarkdownFlavor::MkDocs);
+        assert_eq!(cells.len(), 2);
+        assert!(cells[1].contains("`a | b | c`"));
+    }
+
+    #[test]
+    fn test_split_table_row_with_flavor_standard() {
+        // Pipes in inline code are NOT cell delimiters for any flavor
+        let cells =
+            TableUtils::split_table_row_with_flavor("| Type | `x | y` |", crate::config::MarkdownFlavor::Standard);
+        assert_eq!(
+            cells.len(),
+            2,
+            "Pipes in code spans should not be cell delimiters, got {cells:?}"
+        );
+        assert!(
+            cells[1].contains("`x | y`"),
+            "Inline code with pipe should be single cell"
+        );
+    }
+
+    #[test]
+    fn test_split_table_row_with_flavor_obsidian_wikilink() {
+        // Obsidian flavor: the pipe in [[Target|Label]] separates a link from its
+        // alias, not one cell from the next
+        let cells = TableUtils::split_table_row_with_flavor(
+            "| Alice | [[White Rabbit|the Rabbit]] |",
+            crate::config::MarkdownFlavor::Obsidian,
+        );
+        assert_eq!(cells.len(), 2, "Aliased wikilink should be one cell, got {cells:?}");
+        assert!(cells[1].contains("[[White Rabbit|the Rabbit]]"));
+
+        // Two aliased wikilinks in one cell
+        let cells = TableUtils::split_table_row_with_flavor(
+            "| Guests | [[Mad Hatter|the Hatter]] and [[March Hare|the Hare]] |",
+            crate::config::MarkdownFlavor::Obsidian,
+        );
+        assert_eq!(
+            cells.len(),
+            2,
+            "Two aliased wikilinks should be one cell, got {cells:?}"
+        );
+
+        // A plain wikilink has no pipe to mask
+        let cells = TableUtils::split_table_row_with_flavor(
+            "| Alice | [[Cheshire Cat]] |",
+            crate::config::MarkdownFlavor::Obsidian,
+        );
+        assert_eq!(cells.len(), 2);
+
+        // An unterminated wikilink must not swallow the rest of the row
+        let cells = TableUtils::split_table_row_with_flavor(
+            "| Alice | [[White Rabbit | curious |",
+            crate::config::MarkdownFlavor::Obsidian,
+        );
+        assert_eq!(
+            cells.len(),
+            3,
+            "Unterminated wikilink should not mask pipes, got {cells:?}"
+        );
+    }
+
+    #[test]
+    fn test_split_table_row_wikilink_only_for_obsidian() {
+        // Other flavors keep GFM behaviour: an unescaped pipe is a cell delimiter
+        for flavor in [
+            crate::config::MarkdownFlavor::Standard,
+            crate::config::MarkdownFlavor::MkDocs,
+        ] {
+            let cells = TableUtils::split_table_row_with_flavor("| Alice | [[White Rabbit|the Rabbit]] |", flavor);
+            assert_eq!(
+                cells.len(),
+                3,
+                "{flavor:?} should treat the wikilink pipe as a delimiter, got {cells:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mask_pipes_in_wikilinks_preserves_length() {
+        // Masking must not change length, or cell offsets drift
+        for text in [
+            "| Alice | [[White Rabbit|the Rabbit]] |",
+            "| [[Mad Hatter|Hatter]] | [[March Hare|Hare]] |",
+            "no wikilink here | just a pipe",
+            "[[unterminated | still text",
+        ] {
+            assert_eq!(
+                TableUtils::mask_pipes_in_wikilinks(text).len(),
+                text.len(),
+                "masking changed length of {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wikilink_brackets_in_a_code_span_stay_prose() {
+        // Code binds tighter than a link, so brackets quoted as code open nothing.
+        // Reading them as a link would merge four well-formed cells into fewer and
+        // report a column-count mismatch against a table that has none.
+        for row in [
+            "| `[[` | mid | `]]` |",
+            "| `[[Target` | mid | `Label]]` |",
+            "| a | `[[` | b | `]]` |",
+            // A quoted "[[" is not an opener even when a real "]]" follows it
+            // outside the span, so the pipe between them stays a delimiter.
+            "| `[[` and Target|Label]] |",
+        ] {
+            let obsidian = TableUtils::split_table_row_with_flavor(row, crate::config::MarkdownFlavor::Obsidian);
+            let standard = TableUtils::split_table_row_with_flavor(row, crate::config::MarkdownFlavor::Standard);
+            assert_eq!(
+                obsidian, standard,
+                "Obsidian disagreed with GFM about {row:?}: {obsidian:?} vs {standard:?}"
+            );
+        }
+
+        // A code span inside a genuine wikilink is content of the alias, so the
+        // link still closes at its own "]]" and the row is one cell.
+        let cells = TableUtils::split_table_row_with_flavor(
+            "| [[Target|Label with `a|b` inside]] |",
+            crate::config::MarkdownFlavor::Obsidian,
+        );
+        assert_eq!(
+            cells.len(),
+            1,
+            "Wikilink holding a code span should be one cell, got {cells:?}"
+        );
+
+        // A "]]" that only exists inside a code span does not close the link, so
+        // there is nothing to mask and the pipes stay delimiters.
+        let cells = TableUtils::split_table_row_with_flavor(
+            "| [[Target | alias `]]` | tail |",
+            crate::config::MarkdownFlavor::Obsidian,
+        );
+        assert_eq!(
+            cells.len(),
+            3,
+            "A closer hidden in code should not close the link, got {cells:?}"
+        );
+    }
+
+    #[test]
+    fn test_wikilink_with_a_blank_target_stays_prose() {
+        // The half before the pipe names the note, so a blank one means these
+        // brackets are prose that happens to straddle a cell divider.
+        for row in [
+            "| [[ | ]] |",
+            "| [[|Label]] |",
+            "| starts [[ | ends ]] here |",
+            "| [[\t|\tx]] |",
+        ] {
+            let obsidian = TableUtils::split_table_row_with_flavor(row, crate::config::MarkdownFlavor::Obsidian);
+            let standard = TableUtils::split_table_row_with_flavor(row, crate::config::MarkdownFlavor::Standard);
+            assert_eq!(
+                obsidian, standard,
+                "Obsidian disagreed with GFM about {row:?}: {obsidian:?} vs {standard:?}"
+            );
+        }
+
+        // Positive control: one non-whitespace character of target is a link.
+        let cells = TableUtils::split_table_row_with_flavor("| [[x | y]] |", crate::config::MarkdownFlavor::Obsidian);
+        assert_eq!(cells.len(), 1, "A named target should be one cell, got {cells:?}");
+    }
+
+    #[test]
+    fn test_inline_code_spans_agree_with_pipe_masking() {
+        // Both maskers read one definition of a code span, so an unmatched run of
+        // backticks is literal text to both and scanning resumes just after it.
+        let text = "``x | y and `c|d`";
+        let chars: Vec<char> = text.chars().collect();
+        let spans = TableUtils::inline_code_spans(&chars);
+        assert_eq!(spans.len(), 1, "Only the matched pair is a code span, got {spans:?}");
+        let (start, end) = spans[0];
+        assert_eq!(
+            chars[start..end].iter().collect::<String>(),
+            "`c|d`",
+            "The span should start at the run that closes, not the unmatched opener"
+        );
+
+        // The pipe outside every span survives; the one inside is masked.
+        assert_eq!(TableUtils::mask_pipes_in_inline_code(text), "``x | y and `c_d`");
+    }
+
+    // === extract_blockquote_prefix tests ===
+
+    #[test]
+    fn test_extract_blockquote_prefix_no_blockquote() {
+        // Regular table row without blockquote
+        let (prefix, content) = TableUtils::extract_blockquote_prefix("| H1 | H2 |");
+        assert_eq!(prefix, "");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_extract_blockquote_prefix_single_level() {
+        // Single blockquote level
+        let (prefix, content) = TableUtils::extract_blockquote_prefix("> | H1 | H2 |");
+        assert_eq!(prefix, "> ");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_extract_blockquote_prefix_double_level() {
+        // Double blockquote level
+        let (prefix, content) = TableUtils::extract_blockquote_prefix(">> | H1 | H2 |");
+        assert_eq!(prefix, ">> ");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_extract_blockquote_prefix_triple_level() {
+        // Triple blockquote level
+        let (prefix, content) = TableUtils::extract_blockquote_prefix(">>> | H1 | H2 |");
+        assert_eq!(prefix, ">>> ");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_extract_blockquote_prefix_with_spaces() {
+        // Blockquote with spaces between markers
+        let (prefix, content) = TableUtils::extract_blockquote_prefix("> > | H1 | H2 |");
+        assert_eq!(prefix, "> > ");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_extract_blockquote_prefix_indented() {
+        // Indented blockquote
+        let (prefix, content) = TableUtils::extract_blockquote_prefix("  > | H1 | H2 |");
+        assert_eq!(prefix, "  > ");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_extract_blockquote_prefix_no_space_after() {
+        // Blockquote without space after marker
+        let (prefix, content) = TableUtils::extract_blockquote_prefix(">| H1 | H2 |");
+        assert_eq!(prefix, ">");
+        assert_eq!(content, "| H1 | H2 |");
+    }
+
+    #[test]
+    fn test_determine_pipe_style_in_blockquote() {
+        // determine_pipe_style should handle blockquotes correctly
+        assert_eq!(
+            TableUtils::determine_pipe_style("> | H1 | H2 |"),
+            Some("leading_and_trailing")
+        );
+        assert_eq!(
+            TableUtils::determine_pipe_style("> H1 | H2"),
+            Some("no_leading_or_trailing")
+        );
+        assert_eq!(
+            TableUtils::determine_pipe_style(">> | H1 | H2 |"),
+            Some("leading_and_trailing")
+        );
+        assert_eq!(TableUtils::determine_pipe_style(">>> | H1 | H2"), Some("leading_only"));
+    }
+
+    #[test]
+    fn test_list_table_delimiter_requires_indentation() {
+        // Test case: list item contains pipe, but delimiter line is at column 1
+        // This should NOT be detected as a list table since the delimiter has no indentation.
+        // The result is a non-list table starting at line 0 (the list item becomes the header)
+        // but list_context should be None.
+        let content = "- List item with | pipe\n|---|---|\n| Cell 1 | Cell 2 |";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+
+        // The table will be detected starting at line 0, but crucially it should NOT have
+        // list_context set, meaning it won't be treated as a list-table for column count purposes
+        assert_eq!(tables.len(), 1, "Should find exactly one table");
+        assert!(
+            tables[0].list_context.is_none(),
+            "Should NOT have list context since delimiter has no indentation"
+        );
+    }
+
+    #[test]
+    fn test_list_table_with_properly_indented_delimiter() {
+        // Test case: list item with table header, delimiter properly indented
+        // This SHOULD be detected as a list table
+        let content = "- | Header 1 | Header 2 |\n  |----------|----------|\n  | Cell 1   | Cell 2   |";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let tables = TableUtils::find_table_blocks(content, &ctx);
+
+        // Should find exactly one list-table starting at line 0
+        assert_eq!(tables.len(), 1, "Should find exactly one table");
+        assert_eq!(tables[0].start_line, 0, "Table should start at list item line");
+        assert!(
+            tables[0].list_context.is_some(),
+            "Should be a list table since delimiter is properly indented"
+        );
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_regular_backticks() {
+        // Regular backtick code span: pipe should be masked
+        let result = TableUtils::mask_pipes_in_inline_code("| `code | here` |");
+        assert_eq!(result, "| `code _ here` |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_escaped_backtick_not_code_span() {
+        // Escaped backtick (\`) is literal text, not a code span opener.
+        // The pipe should NOT be masked.
+        let result = TableUtils::mask_pipes_in_inline_code(r"| \`not code | still pipe\` |");
+        assert_eq!(result, r"| \`not code | still pipe\` |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_escaped_backslash_then_backtick() {
+        // Escaped backslash (\\) followed by backtick: the backtick IS a code span opener.
+        // The pipe inside the code span SHOULD be masked.
+        let result = TableUtils::mask_pipes_in_inline_code(r"| \\`real code | masked\\` |");
+        // \\` = escaped backslash + real backtick (code span opener)
+        // The pipe between the backticks should be masked
+        assert_eq!(result, r"| \\`real code _ masked\\` |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_triple_backslash_before_backtick() {
+        // Three backslashes before backtick: odd count means backtick is escaped
+        let result = TableUtils::mask_pipes_in_inline_code(r"| \\\`not code | pipe\\\` |");
+        assert_eq!(result, r"| \\\`not code | pipe\\\` |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_four_backslashes_before_backtick() {
+        // Four backslashes before backtick: even count means backtick is a real delimiter
+        let result = TableUtils::mask_pipes_in_inline_code(r"| \\\\`code | here\\\\` |");
+        assert_eq!(result, r"| \\\\`code _ here\\\\` |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_no_backslash() {
+        // No backslashes at all: standard behavior, pipe inside code span is masked
+        let result = TableUtils::mask_pipes_in_inline_code("before `a | b` after");
+        assert_eq!(result, "before `a _ b` after");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_no_code_span() {
+        // No backticks at all: nothing should be masked
+        let result = TableUtils::mask_pipes_in_inline_code("| col1 | col2 |");
+        assert_eq!(result, "| col1 | col2 |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_backslash_before_closing_backtick() {
+        // Per CommonMark spec, backslash escapes do NOT work inside code spans.
+        // Inside a code span, `\` is a literal character. So `foo\` is a valid
+        // code span containing "foo\", and the closing backtick is NOT escaped.
+        //
+        // Input: | `foo\` | bar |
+        // The code span is `foo\` (backtick opens, backslash is literal, backtick closes).
+        // The pipe after the code span is a real delimiter, producing 2 cells.
+        // The pipe inside the code span should be left alone (there isn't one here).
+        let result = TableUtils::mask_pipes_in_inline_code(r"| `foo\` | bar |");
+        // The backslash before closing backtick is literal inside the code span,
+        // so the code span closes at that backtick. The pipe between cells is NOT masked.
+        assert_eq!(result, r"| `foo\` | bar |");
+    }
+
+    #[test]
+    fn test_mask_pipes_in_inline_code_backslash_literal_with_pipe_inside() {
+        // Code span contains a backslash and a pipe: `a\|b`
+        // The backslash is literal inside the code span (CommonMark spec).
+        // The pipe is inside the code span, so it should be masked.
+        let result = TableUtils::mask_pipes_in_inline_code(r"| `a\|b` | col2 |");
+        assert_eq!(result, r"| `a\_b` | col2 |");
+    }
+
+    #[test]
+    fn test_count_preceding_backslashes() {
+        let chars: Vec<char> = r"abc\\\`def".chars().collect();
+        // Position of backtick is at index 6 (a=0, b=1, c=2, \=3, \=4, \=5, `=6)
+        assert_eq!(TableUtils::count_preceding_backslashes(&chars, 6), 3);
+
+        let chars2: Vec<char> = r"abc\\`def".chars().collect();
+        // Position of backtick is at index 5
+        assert_eq!(TableUtils::count_preceding_backslashes(&chars2, 5), 2);
+
+        let chars3: Vec<char> = "`def".chars().collect();
+        // Position of backtick is at index 0 -- no preceding chars
+        assert_eq!(TableUtils::count_preceding_backslashes(&chars3, 0), 0);
+    }
+
+    #[test]
+    fn test_has_unescaped_pipe_backslash_literal_in_code_span() {
+        // Per CommonMark: backslashes are literal inside code spans.
+        // `foo\` is a complete code span, so the pipe after it is outside code.
+        assert!(TableUtils::has_unescaped_pipe_outside_spans(r"`foo\` | bar", false));
+
+        // Escaped backtick outside code span: \` is not a code span opener
+        assert!(TableUtils::has_unescaped_pipe_outside_spans(r"\`foo | bar\`", false));
+
+        // Pipe inside code span should not count
+        assert!(!TableUtils::has_unescaped_pipe_outside_spans(r"`foo | bar`", false));
+    }
+
+    #[test]
+    fn test_table_after_code_span_detected() {
+        use crate::config::MarkdownFlavor;
+
+        let content = "`code`\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        assert!(!ctx.table_blocks.is_empty(), "Table after code span should be detected");
+    }
+
+    #[test]
+    fn test_table_inside_html_comment_not_detected() {
+        use crate::config::MarkdownFlavor;
+
+        let content = "<!--\n| A | B |\n|---|---|\n| 1 | 2 |\n-->\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        assert!(
+            ctx.table_blocks.is_empty(),
+            "Table inside HTML comment should not be detected"
+        );
+    }
+}

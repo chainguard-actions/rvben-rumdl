@@ -1,0 +1,809 @@
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::rules::emphasis_style::EmphasisStyle;
+use crate::utils::emphasis_utils::find_single_emphasis_edges;
+use crate::utils::skip_context::is_in_mkdocs_markup;
+
+mod md049_config;
+use md049_config::MD049Config;
+
+/// Rule MD049: Emphasis style
+///
+/// See [docs/md049.md](../../docs/md049.md) for full documentation, configuration, and examples.
+///
+/// This rule is triggered when the style for emphasis is inconsistent:
+/// - Asterisks: `*text*`
+/// - Underscores: `_text_`
+///
+/// This rule is focused on regular emphasis, not strong emphasis.
+#[derive(Debug, Default, Clone)]
+pub struct MD049EmphasisStyle {
+    config: MD049Config,
+}
+
+impl MD049EmphasisStyle {
+    /// Create a new instance of MD049EmphasisStyle
+    pub fn new(style: EmphasisStyle) -> Self {
+        MD049EmphasisStyle {
+            config: MD049Config { style },
+        }
+    }
+
+    pub fn from_config_struct(config: MD049Config) -> Self {
+        Self { config }
+    }
+
+    /// Check if a byte position is within a link (inline links, reference links, or reference definitions).
+    /// Delegates to LintContext::is_in_link which uses O(log n) binary search.
+    fn is_in_link(ctx: &crate::lint_context::LintContext, byte_pos: usize) -> bool {
+        ctx.is_in_link(byte_pos)
+    }
+
+    fn collect_emphasis_from_line<'a>(
+        &self,
+        syntax: crate::lint_context::EmphasisLine<'a>,
+        line_start_pos: usize,
+        emphasis_info: &mut Vec<(usize, usize, usize, char, &'a str)>,
+    ) {
+        for span in find_single_emphasis_edges(syntax.without_code(), syntax.markers) {
+            let original_content = &syntax.source()[span.opening.end_pos()..span.closing.start_pos];
+            emphasis_info.push((
+                syntax.line_num,
+                span.opening.start_pos + 1,
+                line_start_pos + span.opening.start_pos,
+                span.opening.as_char(),
+                original_content,
+            ));
+        }
+    }
+}
+
+impl Rule for MD049EmphasisStyle {
+    fn native_format_policy(&self) -> Option<crate::format_proof::NativeFormatPolicy> {
+        (self.config == Default::default()).then_some(crate::format_proof::NativeFormatPolicy::for_rule::<Self>(49))
+    }
+
+    fn name(&self) -> &'static str {
+        "MD049"
+    }
+
+    fn description(&self) -> &'static str {
+        "Emphasis style should be consistent"
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Emphasis
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let mut warnings = vec![];
+
+        // Early return if no emphasis markers
+        if !ctx.likely_has_emphasis() {
+            return Ok(warnings);
+        }
+
+        // Use LintContext to skip code blocks
+        // Source-location queries preserve correct offsets across all line ending types.
+
+        // Collect all emphasis from the document
+        let mut emphasis_info = vec![];
+
+        for syntax in ctx.lexical_emphasis() {
+            // MD037 retains comment lines until its position-level checks;
+            // MD049 excludes the whole line, as its previous iterator did.
+            if ctx.lines[syntax.line_num - 1].in_html_comment {
+                continue;
+            }
+            let line_start = ctx.line_start_byte(syntax.line_num).unwrap_or(0);
+            self.collect_emphasis_from_line(syntax, line_start, &mut emphasis_info);
+        }
+
+        // Filter out emphasis markers that are inside links or MkDocs markup
+        let lines = ctx.raw_lines();
+        // Math byte ranges, computed once for the whole document. The
+        // line-level `skip_math_blocks` filter drops whole math-only lines,
+        // but a line that mixes a display span with lintable prose (e.g.
+        // `$$ _x_ $$ $$ _y_ $$`) stays lintable so trailing prose is checked;
+        // this byte-level guard then exempts only the underscores that fall
+        // inside the line-start `$$...$$` span, matching MD037/MD050.
+        // `math_byte_ranges` has no code-block awareness, so a `$$` inside a
+        // fenced code block would wrongly open a span that swallows real
+        // prose up to the next `$$`. Neutralize `$` bytes inside code-block
+        // ranges first (replacing only the ASCII `$` keeps every byte offset
+        // and UTF-8 validity intact) so the byte model agrees with the
+        // code-block-aware line-level math map.
+        // Sort and merge so membership is a binary search rather than a
+        // per-span linear scan: a math-heavy document (many `$x$` spans
+        // alternating with emphasis) would otherwise be O(spans x ranges).
+        // Ranges may overlap (e.g. a `$b$` inside a `$$...$$` block), so the
+        // merge collapses them into disjoint, ascending intervals.
+        let math_ranges: Vec<(usize, usize)> = if emphasis_info.is_empty() || !ctx.has_char('$') {
+            Vec::new()
+        } else {
+            // A `$` inside fenced code or an inline code span is never a math
+            // delimiter, but `math_byte_ranges` does not know that. Neutralize
+            // those `$` first so the byte model agrees with the code-block-
+            // aware line-level math map and inline code cannot synthesize a
+            // span around real emphasis.
+            let code_spans = ctx.source_code_spans();
+            let math_source: std::borrow::Cow<'_, str> = if ctx.code_blocks.is_empty() && code_spans.is_empty() {
+                std::borrow::Cow::Borrowed(ctx.content)
+            } else {
+                let mut bytes = ctx.content.as_bytes().to_vec();
+                let len = bytes.len();
+                let mut mask = |start: usize, end: usize| {
+                    for b in &mut bytes[start.min(len)..end.min(len)] {
+                        if *b == b'$' {
+                            *b = b' ';
+                        }
+                    }
+                };
+                for &(start, end) in &ctx.code_blocks {
+                    mask(start, end);
+                }
+                for span in code_spans {
+                    mask(span.byte_offset, span.byte_end);
+                }
+                // Only ASCII `$` was replaced with ASCII space, so the
+                // buffer is still valid UTF-8 and the same length.
+                std::borrow::Cow::Owned(String::from_utf8(bytes).expect("ASCII-only substitution"))
+            };
+            let mut r = crate::utils::skip_context::math_byte_ranges(&math_source);
+            r.sort_unstable_by_key(|&(start, _)| start);
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(r.len());
+            for (start, end) in r {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
+            }
+            merged
+        };
+        let has_html = ctx.has_char('<');
+        emphasis_info.retain(|(line_num, col, abs_pos, _, emphasis_content)| {
+            let closing_pos = *abs_pos + emphasis_content.len() + 1;
+            if ctx.overlaps_mdx_inline_code(*abs_pos, closing_pos + 1)
+                || ctx.is_in_jinja_string(*abs_pos)
+                || ctx.is_in_jinja_string(closing_pos)
+                || ctx.is_in_shortcode(*abs_pos)
+                || ctx.is_in_shortcode(closing_pos)
+            {
+                return false;
+            }
+            // HTML attributes and comments contain literal markers. Neither
+            // end of an emphasis pair can come from those contexts.
+            if has_html
+                && [*abs_pos, closing_pos].into_iter().any(|pos| {
+                    ctx.is_in_html_comment(pos) || ctx.is_in_html_tag(pos) || ctx.is_in_jsx_component_tag(pos)
+                })
+            {
+                return false;
+            }
+            // A code span can cross lines, so per-line code masking alone is
+            // insufficient. Either marker inside code makes this a false span.
+            if ctx.is_in_code_span_byte(*abs_pos) || ctx.is_in_code_span_byte(closing_pos) {
+                return false;
+            }
+            // Skip emphasis inside math. `math_ranges` is disjoint and sorted
+            // by start, so the only interval that can contain `abs_pos` is
+            // the last one whose start is <= `abs_pos`.
+            let idx = math_ranges.partition_point(|&(start, _)| start <= *abs_pos);
+            if idx > 0 && *abs_pos < math_ranges[idx - 1].1 {
+                return false;
+            }
+            // Skip emphasis inside Obsidian comments
+            if ctx.is_in_obsidian_comment(*abs_pos) {
+                return false;
+            }
+            // Skip if inside a link
+            if Self::is_in_link(ctx, *abs_pos) {
+                return false;
+            }
+            // Skip if inside MkDocs markup (Keys, Caret, Mark, icon shortcodes)
+            if let Some(line) = lines.get(*line_num - 1) {
+                let line_pos = col.saturating_sub(1); // Convert 1-indexed col to 0-indexed position
+                if is_in_mkdocs_markup(line, line_pos, ctx.flavor) {
+                    return false;
+                }
+            }
+            true
+        });
+
+        match self.config.style {
+            EmphasisStyle::Consistent => {
+                // If we have less than 2 emphasis nodes, no need to check consistency
+                if emphasis_info.len() < 2 {
+                    return Ok(warnings);
+                }
+
+                // Count how many times each marker appears (prevalence-based approach)
+                let asterisk_count = emphasis_info.iter().filter(|(_, _, _, m, _)| *m == '*').count();
+                let underscore_count = emphasis_info.iter().filter(|(_, _, _, m, _)| *m == '_').count();
+
+                // Use the most prevalent marker as the target style
+                // In case of a tie, prefer asterisk (matches CommonMark recommendation)
+                let target_marker = if asterisk_count >= underscore_count { '*' } else { '_' };
+
+                // Check all emphasis nodes for consistency with the prevalent style
+                for (line_num, _col, abs_pos, marker, content) in &emphasis_info {
+                    if *marker != target_marker {
+                        // Calculate emphasis length (marker + content + marker).
+                        // The byte length drives the Fix range; the character length
+                        // drives the displayed end column.
+                        let emphasis_len = 1 + content.len() + 1;
+                        let (_, char_col) = ctx.offset_to_line_col(*abs_pos);
+
+                        warnings.push(LintWarning {
+                            rule_name: Some(self.name().to_string()),
+                            line: *line_num,
+                            column: char_col,
+                            end_line: *line_num,
+                            end_column: char_col + content.chars().count() + 2,
+                            message: format!("Emphasis should use {target_marker} instead of {marker}"),
+                            fix: Some(Fix::new(
+                                *abs_pos..*abs_pos + emphasis_len,
+                                format!("{target_marker}{content}{target_marker}"),
+                            )),
+                            severity: Severity::Warning,
+                        });
+                    }
+                }
+            }
+            EmphasisStyle::Asterisk | EmphasisStyle::Underscore => {
+                let (wrong_marker, correct_marker) = match self.config.style {
+                    EmphasisStyle::Asterisk => ('_', '*'),
+                    EmphasisStyle::Underscore => ('*', '_'),
+                    EmphasisStyle::Consistent => {
+                        // This case is handled separately above
+                        // but fallback to asterisk style for safety
+                        ('_', '*')
+                    }
+                };
+
+                for (line_num, _col, abs_pos, marker, content) in &emphasis_info {
+                    if *marker == wrong_marker {
+                        // Calculate emphasis length (marker + content + marker).
+                        // The byte length drives the Fix range; the character length
+                        // drives the displayed end column.
+                        let emphasis_len = 1 + content.len() + 1;
+                        let (_, char_col) = ctx.offset_to_line_col(*abs_pos);
+
+                        warnings.push(LintWarning {
+                            rule_name: Some(self.name().to_string()),
+                            line: *line_num,
+                            column: char_col,
+                            end_line: *line_num,
+                            end_column: char_col + content.chars().count() + 2,
+                            message: format!("Emphasis should use {correct_marker} instead of {wrong_marker}"),
+                            fix: Some(Fix::new(
+                                *abs_pos..*abs_pos + emphasis_len,
+                                format!("{correct_marker}{content}{correct_marker}"),
+                            )),
+                            severity: Severity::Warning,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        // Get all warnings with their fixes
+        let warnings = self.check(ctx)?;
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+
+        // If no warnings, return original content
+        if warnings.is_empty() {
+            return Ok(ctx.content.to_string());
+        }
+
+        // Collect all fixes and sort by range start (descending) to apply from end to beginning
+        let mut fixes: Vec<_> = warnings
+            .iter()
+            .filter_map(|w| w.fix.as_ref().map(|f| (f.range.start, f.range.end, &f.replacement)))
+            .collect();
+        fixes.sort_by_key(|f| std::cmp::Reverse(f.0));
+
+        // Apply fixes from end to beginning to preserve byte offsets
+        let mut result = ctx.content.to_string();
+        for (start, end, replacement) in fixes {
+            if start < result.len() && end <= result.len() && start <= end {
+                result.replace_range(start..end, replacement);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Check if this rule should be skipped
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        ctx.content.is_empty() || !ctx.likely_has_emphasis()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    crate::impl_rule_config_methods!(MD049Config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shortcode_markers_are_not_restyled() {
+        for (style, original, replacement) in [
+            (EmphasisStyle::Underscore, "*", "_"),
+            (EmphasisStyle::Asterisk, "_", "*"),
+        ] {
+            let rule = MD049EmphasisStyle::new(style);
+            for shortcode in [
+                format!("{{{{< note title=\"{original}literal{original}\" >}}}}"),
+                format!("{{{{% note title=\"{original}内容{original}\" %}}}}"),
+                format!("{{{{< note\n title=\"{original}literal{original}\" >}}}}"),
+                format!("{original}text {{{{< note title=\"{original}\" >}}}}"),
+            ] {
+                let source = format!("Before {shortcode}\n\n{original}visible{original}\n");
+                let expected = format!("Before {shortcode}\n\n{replacement}visible{replacement}\n");
+                let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::Hugo, None);
+                assert_eq!(
+                    rule.check(&ctx).unwrap().len(),
+                    1,
+                    "shortcode arguments are literal: {source}"
+                );
+                assert_eq!(rule.fix(&ctx).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shortcode_arguments_do_not_determine_consistent_style() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+        let source = "Before {{< note title=\"*a* *b* *c*\" >}}\n\n_first_ _second_ *visible*\n";
+        let expected = "Before {{< note title=\"*a* *b* *c*\" >}}\n\n_first_ _second_ _visible_\n";
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::Hugo, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_myst_comments_do_not_determine_consistent_style() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+        let source = "% *a* *b* *c*\n\n_first_ _second_ *visible*\n";
+        let expected = "% *a* *b* *c*\n\n_first_ _second_ _visible_\n";
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::MyST, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_myst_comment_contents_are_not_linted() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        for prefix in ["% ", "%", "  %\t", "   % "] {
+            let source = format!("{prefix}*literal*\n\nBefore *visible*\n");
+            let expected = format!("{prefix}*literal*\n\nBefore _visible_\n");
+            let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::MyST, None);
+            let warnings = rule.check(&ctx).unwrap();
+            assert_eq!(warnings.len(), 1, "comments are not visible prose: {source}");
+            assert_eq!(warnings[0].line, 3);
+            assert_eq!(rule.fix(&ctx).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_jinja_quoted_markers_are_not_restyled() {
+        for (style, original, replacement) in [
+            (EmphasisStyle::Underscore, "*", "_"),
+            (EmphasisStyle::Asterisk, "_", "*"),
+        ] {
+            let rule = MD049EmphasisStyle::new(style);
+            for template in [
+                format!("{{{{ \"{original}literal{original}\" }}}}"),
+                format!("{{% set text = '{original}内容{original}' %}}"),
+                format!("{{{{\n  \"{original}literal{original}\"\n}}}}"),
+                format!("{original}text {{{{ \"{original}\" }}}}"),
+            ] {
+                let source = format!("Before {template}\n\n{original}visible{original}\n");
+                let expected = format!("Before {template}\n\n{replacement}visible{replacement}\n");
+                let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::Standard, None);
+                assert_eq!(
+                    rule.check(&ctx).unwrap().len(),
+                    1,
+                    "quoted markers are literal: {source}"
+                );
+                assert_eq!(rule.fix(&ctx).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_jinja_quoted_markers_do_not_determine_consistent_style() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+        let source = "Before {{ \"*a* *b* *c*\" }}\n\n_first_ _second_ *visible*\n";
+        let expected = "Before {{ \"*a* *b* *c*\" }}\n\n_first_ _second_ _visible_\n";
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::Standard, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_mdx_module_strings_are_not_restyled() {
+        for (style, original, replacement) in [
+            (EmphasisStyle::Underscore, "*", "_"),
+            (EmphasisStyle::Asterisk, "_", "*"),
+        ] {
+            let rule = MD049EmphasisStyle::new(style);
+            for module in [
+                format!("export const text = \"{original}literal{original}\""),
+                format!("export const data = {{\n  text: \"{original}内容{original}\"\n}}"),
+                format!("import text from \"./{original}literal{original}.js\""),
+            ] {
+                let source = format!("{module}\n\n{original}visible{original}\n");
+                let expected = format!("{module}\n\n{replacement}visible{replacement}\n");
+                let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::MDX, None);
+                let warnings = rule.check(&ctx).unwrap();
+                assert_eq!(warnings.len(), 1, "module strings must stay literal: {source}");
+                assert!(warnings[0].line > module.lines().count());
+                assert_eq!(rule.fix(&ctx).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mdx_module_strings_do_not_determine_consistent_style() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+        let source = "export const text = \"*a* *b* *c*\"\n\n_first_ _second_ *visible*\n";
+        let expected = "export const text = \"*a* *b* *c*\"\n\n_first_ _second_ _visible_\n";
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::MDX, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_inline_html_literals_are_not_restyled() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        for html in [
+            "Before <!-- *literal* -->",
+            "Before <span title=\"*literal*\">visible</span>",
+            "Before <span\n title=\"*literal*\">visible</span>",
+            "日本語 <span title=\"*内容*\">表示</span>",
+            "Before *text <span title=\"*\">visible</span>",
+        ] {
+            let source = format!("_one_ _two_\n\n{html}\n");
+            let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::Standard, None);
+            assert!(
+                rule.check(&ctx).unwrap().is_empty(),
+                "HTML markers are literal: {source}"
+            );
+            assert_eq!(rule.fix(&ctx).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn test_emphasis_beside_html_attributes_still_gets_fixed() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        let source = "Before <span title=\"*literal*\">*visible*</span> <!-- *hidden* -->\n";
+        let expected = "Before <span title=\"*literal*\">_visible_</span> <!-- *hidden* -->\n";
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::Standard, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+        let mut original_html = String::new();
+        let mut fixed_html = String::new();
+        pulldown_cmark::html::push_html(&mut original_html, pulldown_cmark::Parser::new(source));
+        pulldown_cmark::html::push_html(&mut fixed_html, pulldown_cmark::Parser::new(expected));
+        assert_eq!(original_html, fixed_html);
+    }
+
+    #[test]
+    fn test_multiline_code_span_contents_are_not_restyled() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        for code in [
+            "`code\n*literal*\nend`",
+            "``start `tick`\n*literal*\nend``",
+            "`start\n*code` after*",
+            "日本語 `開始\n*内容*\n終了`",
+        ] {
+            let content = format!("_one_ _two_\n\n{code}\n");
+            let ctx = crate::lint_context::LintContext::new(&content, crate::config::MarkdownFlavor::Standard, None);
+            assert!(
+                rule.check(&ctx).unwrap().is_empty(),
+                "the asterisks are code: {content}"
+            );
+            assert_eq!(rule.fix(&ctx).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn test_emphasis_beside_multiline_code_still_gets_fixed() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        let source = "_one_ _two_\n\n`start\n*literal*\nend` and *visible*\n";
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].line, 5);
+        let expected = "_one_ _two_\n\n`start\n*literal*\nend` and _visible_\n";
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+        let fixed_ctx = crate::lint_context::LintContext::new(expected, crate::config::MarkdownFlavor::Standard, None);
+        assert!(rule.check(&fixed_ctx).unwrap().is_empty());
+        assert_eq!(rule.fix(&fixed_ctx).unwrap(), expected);
+        let mut original_html = String::new();
+        let mut fixed_html = String::new();
+        pulldown_cmark::html::push_html(&mut original_html, pulldown_cmark::Parser::new(source));
+        pulldown_cmark::html::push_html(&mut fixed_html, pulldown_cmark::Parser::new(expected));
+        assert_eq!(original_html, fixed_html);
+    }
+
+    #[test]
+    fn test_name() {
+        let rule = MD049EmphasisStyle::default();
+        assert_eq!(rule.name(), "MD049");
+    }
+
+    #[test]
+    fn test_style_from_str() {
+        assert_eq!(EmphasisStyle::from("asterisk"), EmphasisStyle::Asterisk);
+        assert_eq!(EmphasisStyle::from("underscore"), EmphasisStyle::Underscore);
+        assert_eq!(EmphasisStyle::from("other"), EmphasisStyle::Consistent);
+    }
+
+    #[test]
+    fn test_emphasis_in_links_not_flagged() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = r#"Check this [*asterisk*](https://example.com/*pattern*) link and [_underscore_](https://example.com/_private_).
+
+Also see the [`__init__`][__init__] reference.
+
+This should be _flagged_ since we're using asterisk style.
+
+[__init__]: https://example.com/__init__.py"#;
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Only the real emphasis outside links should be flagged
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Emphasis should use * instead of _"));
+        // Should flag "_flagged_" but not emphasis patterns inside links
+        assert!(result[0].line == 5); // Line with "_flagged_"
+    }
+
+    #[test]
+    fn test_emphasis_in_links_vs_outside_links() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        let content = r#"Check [*emphasis*](https://example.com/*test*) and inline *real emphasis* text.
+
+[*link*]: https://example.com/*path*"#;
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Only the actual emphasis outside links should be flagged
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Emphasis should use _ instead of *"));
+        // Should be the "real emphasis" text on line 1
+        assert!(result[0].line == 1);
+    }
+
+    #[test]
+    fn test_mkdocs_keys_notation_not_flagged() {
+        // Keys notation uses ++ which shouldn't be confused with emphasis
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "Press ++ctrl+alt+del++ to restart.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Keys notation should not be flagged as emphasis
+        assert!(
+            result.is_empty(),
+            "Keys notation should not be flagged as emphasis. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_caret_notation_not_flagged() {
+        // Caret notation (^superscript^ and ^^insert^^) should not be flagged
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "This is ^superscript^ and ^^inserted^^ text.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Caret notation should not be flagged as emphasis. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_mark_notation_not_flagged() {
+        // Mark notation (==highlight==) should not be flagged
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "This is ==highlighted== text.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Mark notation should not be flagged as emphasis. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_mixed_content_with_real_emphasis() {
+        // Mixed content: MkDocs markup + real emphasis that should be flagged
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "Press ++ctrl++ and _underscore emphasis_ here.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Only the real underscore emphasis should be flagged (not Keys notation)
+        assert_eq!(result.len(), 1, "Expected 1 warning, got: {result:?}");
+        assert!(result[0].message.contains("Emphasis should use * instead of _"));
+    }
+
+    #[test]
+    fn test_mkdocs_icon_shortcode_not_flagged() {
+        // Icon shortcodes like :material-star: should not affect emphasis detection
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "Click :material-check: and _this should be flagged_.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // The underscore emphasis should still be flagged
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Emphasis should use * instead of _"));
+    }
+
+    #[test]
+    fn test_mkdocstrings_block_not_flagged() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "# Example\n\n::: my_module.MyClass\n    options:\n      members:\n        - _private_method\n";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "_private_method_ inside mkdocstrings block should not be flagged. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_mkdocstrings_block_with_emphasis_outside() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "::: my_module.MyClass\n    options:\n      members:\n        - _init\n\nThis _should be flagged_ outside.\n";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "Only emphasis outside mkdocstrings should be flagged. Got: {result:?}"
+        );
+        assert_eq!(result[0].line, 6);
+    }
+
+    #[test]
+    fn test_inline_code_inside_emphasis_preserved_on_fix() {
+        // Regression test: inline code inside an emphasis span must survive the
+        // style conversion. Previously the 'X' masking placeholder leaked into
+        // the fix output, destroying the code span.
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "- _An item with `inline code` inside._ Trailing text.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "- *An item with `inline code` inside.* Trailing text.");
+        assert!(!fixed.contains('X'), "masking placeholder leaked into fix: {fixed}");
+
+        // Idempotent: fixing the already-fixed content changes nothing.
+        let ctx2 = crate::lint_context::LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        assert_eq!(rule.fix(&ctx2).unwrap(), fixed);
+    }
+
+    #[test]
+    fn test_inline_code_inside_emphasis_underscore_style() {
+        // Same bug in the opposite direction (* -> _).
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        let content = "See *the `id` field* below.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "See _the `id` field_ below.");
+    }
+
+    #[test]
+    fn test_obsidian_inline_comment_emphasis_ignored() {
+        // Emphasis inside Obsidian comments should be ignored
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        let content = "Visible %%_hidden_%% text.";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Should ignore emphasis inside Obsidian comments. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_asterisks_in_an_html_block_are_literal() {
+        // An HTML block is raw HTML: `*://*` in it is text, so it neither counts
+        // toward the consistent style nor gets rewritten to `_://_`.
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+        let content =
+            "Use _a_ and _b_.\n\n<table>\n  <tr>\n    <td><code>*://*.example.org/*</code></td>\n  </tr>\n</table>\n";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        assert!(rule.check(&ctx).unwrap().is_empty());
+        assert_eq!(rule.fix(&ctx).unwrap(), content);
+
+        let content = "Use _a_.\n\n<div>\n*b* and *c*\n</div>\n";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        assert!(rule.check(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_emphasis_after_an_html_block_is_still_checked() {
+        // A blank line ends the HTML block; what follows is Markdown again.
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+        let content = "<div>\n*a*\n</div>\n\nText *b* here.\n";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.iter().map(|w| w.line).collect::<Vec<_>>(), vec![5]);
+    }
+}
+
+#[cfg(test)]
+mod mdx_adjacent_prose_tests {
+    use super::*;
+    #[test]
+    fn md049_mdx_code_does_not_hide_adjacent_prose() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        for code in [
+            "{value}",
+            "{/* _literal_ */}",
+            "{\"_literal_\"}",
+            "<Card onClick={() => null} title='_literal_'>text</Card>",
+        ] {
+            for ending in ["\n", "\r\n"] {
+                let source = format!("内容 Before {code} after _visible_{ending}");
+                let expected = format!("内容 Before {code} after *visible*{ending}");
+                let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::MDX, None);
+                assert_eq!(rule.check(&ctx).unwrap().len(), 1, "{source}");
+                assert_eq!(rule.fix(&ctx).unwrap(), expected);
+            }
+        }
+    }
+    #[test]
+    fn md049_mdx_component_values_are_literal() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        for name in ["span", "Card", "ui.Card", "svg:path"] {
+            let tag = format!("<{name} title='_literal_'>text</{name}>");
+            let source = format!("Before {tag} after _visible_\n");
+            let expected = format!("Before {tag} after *visible*\n");
+            let ctx = crate::lint_context::LintContext::new(&source, crate::config::MarkdownFlavor::MDX, None);
+            assert_eq!(rule.check(&ctx).unwrap().len(), 1, "{source}");
+            assert_eq!(rule.fix(&ctx).unwrap(), expected);
+        }
+    }
+    #[test]
+    fn md049_mdx_literals_do_not_choose_consistent_style() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+        let source = "Before <ui.Card title='*a* *b* *c*'>text</ui.Card> {\"*d* *e*\"}\n\n_first_ _second_ *visible*\n";
+        let expected = source.replace("*visible*", "_visible_");
+        let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::MDX, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), expected);
+    }
+    #[test]
+    fn md049_mdx_code_cannot_supply_the_other_emphasis_marker() {
+        let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+        for source in [
+            "Before _text {\"_\"} after\n",
+            "Before _text {/* _ */} after\n",
+            "Before _text {value} end_\n",
+        ] {
+            let ctx = crate::lint_context::LintContext::new(source, crate::config::MarkdownFlavor::MDX, None);
+            assert!(rule.check(&ctx).unwrap().is_empty(), "{source}");
+            assert_eq!(rule.fix(&ctx).unwrap(), source);
+        }
+    }
+}
