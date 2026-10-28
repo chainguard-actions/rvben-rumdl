@@ -1,0 +1,31 @@
+name: Test fmt rewrites files
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare a copy of the bad file
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/fmt-target"
+          cp tests/fixtures/bad.md "$GITHUB_WORKSPACE/fmt-target/bad.md"
+      - id: action
+        uses: .
+        with:
+          command: fmt
+          path: fmt-target/bad.md
+          config: tests/fixtures/rumdl.toml
+          fail-on-error: "false"
+      - name: Assert file was rewritten
+        run: |
+          cat fmt-target/bad.md
+          if cmp -s tests/fixtures/bad.md fmt-target/bad.md; then
+            echo "FAIL: file was not modified by fmt"
+            exit 1
+          fi
+          if grep -q '^##Missing' fmt-target/bad.md; then
+            echo "FAIL: MD018 violation not fixed"
+            exit 1
+          fi
+          echo "PASS"

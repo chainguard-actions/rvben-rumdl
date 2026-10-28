@@ -1,0 +1,32 @@
+name: Test fail-on-error false with output file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/fixtures/bad.md
+          config: tests/fixtures/rumdl.toml
+          fail-on-error: "false"
+          output-file: rumdl-out/results.txt
+      - name: Assert output file contains violations
+        run: |
+          f="$GITHUB_WORKSPACE/rumdl-out/results.txt"
+          if [ ! -f "$f" ]; then
+            echo "FAIL: output file not created"
+            exit 1
+          fi
+          cat "$f"
+          if ! grep -q "MD0" "$f"; then
+            echo "FAIL: expected rule IDs in output"
+            exit 1
+          fi
+          if ! grep -q "bad.md" "$f"; then
+            echo "FAIL: expected file name in output"
+            exit 1
+          fi
+          echo "PASS"

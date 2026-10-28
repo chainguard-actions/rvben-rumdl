@@ -1,0 +1,35 @@
+name: Test install-only
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          install-only: "true"
+          path: tests/fixtures/bad.md
+      - name: Assert rumdl on PATH and version matches
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+          RPATH: ${{ steps.action.outputs.rumdl-path }}
+        run: |
+          echo "version output: $VERSION"
+          echo "path output: $RPATH"
+          if ! command -v rumdl; then
+            echo "FAIL: rumdl not on PATH"
+            exit 1
+          fi
+          ACTUAL="$(rumdl --version)"
+          echo "rumdl --version: $ACTUAL"
+          if [ -z "$VERSION" ] || [ "${ACTUAL#rumdl }" != "$VERSION" ]; then
+            echo "FAIL: version mismatch"
+            exit 1
+          fi
+          if [ ! -x "$RPATH" ]; then
+            echo "FAIL: rumdl-path not executable"
+            exit 1
+          fi
+          echo "PASS"

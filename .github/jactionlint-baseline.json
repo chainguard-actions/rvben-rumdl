@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "file": ".github/workflows/ci.yml",
+      "rule": "adhoc-packages",
+      "fingerprint": "ade7b849d2a3f074",
+      "context": "710228a726418718",
+      "occurrence": 0,
+      "message": "command \"npm install\" installs a package outside of a lock file: its version and its dependencies are resolved anew on every run. add the package to package.json and commit the package-lock.json and install with `npm ci`"
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "unpinned-images",
+      "fingerprint": "b509e3af804ea294",
+      "context": "06279bbc007235d5",
+      "occurrence": 0,
+      "message": "container image \"node:24-alpine\" is pinned by a tag, which can be moved to another image. pin it to a digest like \"node:24-alpine@sha256:{digest}\""
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "use-trusted-publishing",
+      "fingerprint": "e6682f929c8690c8",
+      "context": "997be5f4db854062",
+      "occurrence": 0,
+      "message": "\"uv publish\" publishes to PyPI with the long-lived credential UV_PUBLISH_TOKEN, although the job can request an OIDC token (\"id-token: write\"). prefer trusted publishing with pypa/gh-action-pypi-publish and the permission \"id-token: write\""
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "adhoc-packages",
+      "fingerprint": "7cbfbd128456482c",
+      "context": "8bb0341e9f94fe60",
+      "occurrence": 0,
+      "message": "command \"npm install\" installs a package outside of a lock file: its dependencies are resolved anew on every run, although its version is pinned. add the package to package.json and commit the package-lock.json and install with `npm ci`"
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "use-trusted-publishing",
+      "fingerprint": "701cedd8e0447af7",
+      "context": "6da86c12e84b42ca",
+      "occurrence": 0,
+      "message": "\"npm publish\" publishes to npm with the long-lived credential NODE_AUTH_TOKEN, although the job can request an OIDC token (\"id-token: write\"). prefer trusted publishing: configure the trusted publisher of the package on npmjs.com and grant the permission \"id-token: write\", then no token is needed"
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "use-trusted-publishing",
+      "fingerprint": "701cedd8e0447af7",
+      "context": "6da86c12e84b42ca",
+      "occurrence": 1,
+      "message": "\"npm publish\" publishes to npm with the long-lived credential NODE_AUTH_TOKEN, although the job can request an OIDC token (\"id-token: write\"). prefer trusted publishing: configure the trusted publisher of the package on npmjs.com and grant the permission \"id-token: write\", then no token is needed"
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "use-trusted-publishing",
+      "fingerprint": "701cedd8e0447af7",
+      "context": "6da86c12e84b42ca",
+      "occurrence": 2,
+      "message": "\"npm publish\" publishes to npm with the long-lived credential NODE_AUTH_TOKEN, although the job can request an OIDC token (\"id-token: write\"). prefer trusted publishing: configure the trusted publisher of the package on npmjs.com and grant the permission \"id-token: write\", then no token is needed"
+    },
+    {
+      "file": ".github/workflows/release.yml",
+      "rule": "superfluous-actions",
+      "fingerprint": "b890989659d7787b",
+      "context": "6c4726436ddcc046",
+      "occurrence": 0,
+      "message": "action \"softprops/action-gh-release@v2\" is superfluous: the runner already has the tools to do this. use `gh release create` in a script step"
+    },
+    {
+      "file": ".github/workflows/test-action.yml",
+      "rule": "unpinned-images",
+      "fingerprint": "c1fc3b5f0d872e55",
+      "context": "6820cb09171977c0",
+      "occurrence": 0,
+      "message": "container image \"python:3.12-slim\" is pinned by a tag, which can be moved to another image. pin it to a digest like \"python:3.12-slim@sha256:{digest}\""
+    },
+    {
+      "file": ".github/workflows/test-action.yml",
+      "rule": "unpinned-images",
+      "fingerprint": "6dea15afa62261bc",
+      "context": "e98865a41084b124",
+      "occurrence": 0,
+      "message": "container image \"python:3.12-slim\" is pinned by a tag, which can be moved to another image. pin it to a digest like \"python:3.12-slim@sha256:{digest}\""
+    }
+  ]
+}
