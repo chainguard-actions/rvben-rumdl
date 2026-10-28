@@ -1,0 +1,3 @@
+# Minimal rumdl config used by the action tests (all default rules enabled).
+[global]
+disable = []

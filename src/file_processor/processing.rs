@@ -1,0 +1,2628 @@
+//! Core file processing, fix application, and fixability checks.
+
+use crate::cache::{DependencyFingerprint, LintCache};
+use crate::formatter;
+use colored::*;
+use rumdl_lib::config as rumdl_config;
+use rumdl_lib::doc_comment_lint::is_rust_source;
+use rumdl_lib::rule::{FixCapability, LintWarning, Rule};
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+use rumdl_lib::code_block_tools::executor::ExecutorError;
+use rumdl_lib::code_block_tools::processor::ProcessorError;
+
+use super::discovery::{AuxiliaryExecutionPlan, RuleSets, discovered_display_path, resolve_discovered_display_path};
+use super::embedded::{
+    check_embedded_markdown_blocks, format_embedded_markdown_blocks, has_fenced_code_blocks, markdown_code_blocks,
+    should_format_embedded_markdown, should_lint_embedded_markdown,
+};
+use super::fix_reporting::reconcile_fixed_warnings;
+use rumdl_lib::utils::bom::strip_bom;
+
+#[cfg(test)]
+mod cleanup_cli_tests {
+    use super::*;
+
+    #[test]
+    fn format_only_cli_uses_cleanup_and_preserves_native_results() {
+        let config = rumdl_config::Config::default();
+        let opt_in = rumdl_lib::rules::opt_in_rules();
+        let document: Vec<_> = rumdl_lib::rules::all_rules(&config)
+            .into_iter()
+            .filter(|rule| !opt_in.contains(rule.name()))
+            .collect();
+        let rules = RuleSets {
+            selected: std::sync::Arc::new(document.iter().map(|rule| dyn_clone::clone_box(&**rule)).collect()),
+            embedded_markdown: document.iter().map(|rule| dyn_clone::clone_box(&**rule)).collect(),
+            document,
+            mode: crate::CodeBlockToolsMode::Configured,
+            auxiliary: AuxiliaryExecutionPlan {
+                lint: true,
+                format: true,
+                relint: true,
+            },
+        };
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("case.md");
+        for source in [
+            "# Heading\nText  body\n## Next\nMore  words\n",
+            "# Title\n\nText https://example.com and _emphasis_ with *one* and *two*. \n\n\nEnd.\n",
+            "# Title\n\nIntro\n- Item\n\nText https://example.com and _word_ with *one* and *two*. \n\n\nEnd.\n",
+            "# Title\nText  body\n## Next\nMore  words\n- item\n    [reference](https://example.test/ref)\n- next\n\nText https://example.com and _word_ with *one* and *two*. \n\n\nEnd.\n",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let mut expected = source.to_owned();
+            let native = rumdl_lib::fix_coordinator::FixCoordinator::new()
+                .apply_fixes_iterative(&rules.document, &[], &mut expected, &config, 100, Some(&path))
+                .unwrap();
+            let candidate = process_file_with_index(
+                &path.to_string_lossy(),
+                &rules,
+                false,
+                true,
+                true,
+                &config,
+                None,
+                None,
+                None,
+                true,
+                true,
+                false,
+            );
+            assert!(!candidate.errored);
+            let (actual, result) = candidate.prepared_fix.unwrap().unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(result.fixed_rule_names, native.fixed_rule_names);
+            assert_eq!(result.rules_fixed, native.rules_fixed);
+            assert_eq!(result.iterations, native.iterations);
+            assert_eq!(result.converged, native.converged);
+            assert_eq!(result.conflict_cycle, native.conflict_cycle);
+            assert!(result.context_creations < native.context_creations);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+}
+
+fn warnings_for_output(
+    mut warnings: Vec<LintWarning>,
+    output_format: &rumdl_lib::output::OutputFormat,
+    line_endings: &rumdl_lib::utils::NormalizedLineEndingMap,
+) -> Vec<LintWarning> {
+    if matches!(output_format, rumdl_lib::output::OutputFormat::Json) {
+        rumdl_lib::output::formatters::json::remap_fix_ranges_to_original(&mut warnings, line_endings);
+    }
+    warnings
+}
+
+/// Result of processing a file through lint and optional fix passes.
+pub struct FileProcessResult {
+    pub has_issues: bool,
+    pub issues_found: usize,
+    /// Whether the fix pass rewrote the file (or, in diff mode, would have).
+    pub content_changed: bool,
+    /// How many of the file's warnings the fix pass resolved.
+    pub summary_issues_fixed: usize,
+    pub fixable_issues: usize,
+    /// In fix mode, contains only remaining (unfixed) warnings.
+    /// In check mode, contains all warnings.
+    pub warnings: Vec<rumdl_lib::rule::LintWarning>,
+    pub file_index: rumdl_lib::workspace_index::FileIndex,
+    pub file_index_reused: bool,
+    /// Part of this file's run did not happen: it could not be read, or a
+    /// code-block tool could not run under a `fail` setting. A tool error
+    /// (exit code 2), distinct from a lint violation (exit code 1).
+    pub errored: bool,
+    /// An inline disable comment referenced an unknown rule name.
+    pub config_warning: bool,
+}
+
+pub fn is_rule_actually_fixable(config: &rumdl_config::Config, rule_name: &str) -> bool {
+    // Check unfixable list
+    if config
+        .global
+        .unfixable
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(rule_name))
+    {
+        return false;
+    }
+
+    // Check fixable list if specified
+    if !config.global.fixable.is_empty() {
+        return config.global.fixable.iter().any(|r| r.eq_ignore_ascii_case(rule_name));
+    }
+
+    true
+}
+
+/// Check if a rule is fixable via CLI (considers both config AND rule's fix_capability)
+///
+/// A rule is CLI-fixable if:
+/// 1. It's not in the unfixable config list
+/// 2. It's in the fixable config list (if specified)
+/// 3. The rule itself doesn't declare FixCapability::Unfixable
+///
+/// This replaces hardcoded rule name checks (e.g., `&& name != "MD033"`) with
+/// capability-based checks that are future-proof for any rule.
+pub fn is_rule_cli_fixable(rules: &[Box<dyn Rule>], config: &rumdl_config::Config, rule_name: &str) -> bool {
+    is_rule_cli_fixable_in(rules, &[], config, rule_name)
+}
+
+/// `is_rule_cli_fixable` for a document that configures some of its rules itself.
+///
+/// `document_rules` holds those rules as the document asked for them, and answers
+/// for the names it covers; every other name is answered from `rules`.
+pub fn is_rule_cli_fixable_in(
+    rules: &[Box<dyn Rule>],
+    document_rules: &[Box<dyn Rule>],
+    config: &rumdl_config::Config,
+    rule_name: &str,
+) -> bool {
+    // First check config-based fixability
+    if !is_rule_actually_fixable(config, rule_name) {
+        return false;
+    }
+
+    // Then check if the rule declares itself as Unfixable
+    // Rules like MD033 have LSP-only fixes (for VS Code quick actions) but
+    // their fix() method returns content unchanged, so CLI shouldn't count them
+    document_rules
+        .iter()
+        .chain(rules)
+        .find(|r| r.name().eq_ignore_ascii_case(rule_name))
+        .is_none_or(|r| r.fix_capability() != FixCapability::Unfixable)
+}
+
+pub use rumdl_lib::rules::rules_reconfigured_by_document;
+
+/// Lint (and, per `fix_mode`, fix) one file and report the outcome.
+///
+/// A panic while processing the file does not unwind into the caller: the other
+/// files of the run are still processed. The file is reported as a tool error
+/// (exit code 2) with the panic's message, and what it left on disk is whatever
+/// was written before the panic.
+///
+/// `format_only` is a CLI request for built-in rules with no diagnostic consumer
+/// or auxiliary tools. It must not be used for lint reports, statistics or preflight.
+/// `check_only` further requests only whether formatting would apply a change;
+/// the caller has already excluded diagnostic, diff and rewrite consumers.
+#[allow(clippy::too_many_arguments)]
+pub fn process_file_with_formatter(
+    file_path: &str,
+    rule_sets: &RuleSets,
+    fix_mode: crate::FixMode,
+    diff: bool,
+    verbose: bool,
+    quiet: bool,
+    silent: bool,
+    output_format: &rumdl_lib::output::OutputFormat,
+    output_writer: &rumdl_lib::output::OutputWriter,
+    config: &rumdl_config::Config,
+    cache: Option<std::sync::Arc<LintCache>>,
+    workspace_index: Option<std::sync::Arc<rumdl_lib::workspace_index::WorkspaceIndex>>,
+    project_root: Option<&Path>,
+    show_full_path: bool,
+    cache_hashes: Option<&CacheHashes>,
+    write_plan: Option<&super::PreflightPlan>,
+    format_only: bool,
+    check_only: bool,
+) -> FileProcessResult {
+    let check_only = check_only
+        && format_only
+        && fix_mode == crate::FixMode::Format
+        && diff
+        && silent
+        && write_plan.is_none()
+        && !config.code_block_tools.enabled;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        process_file_with_formatter_inner(
+            file_path,
+            rule_sets,
+            fix_mode,
+            diff,
+            verbose,
+            quiet,
+            silent,
+            output_format,
+            output_writer,
+            config,
+            cache,
+            workspace_index,
+            project_root,
+            show_full_path,
+            cache_hashes,
+            write_plan,
+            format_only,
+            check_only,
+        )
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            if !silent {
+                eprintln!(
+                    "Error processing file {file_path}: internal error: {}",
+                    panic_message(payload.as_ref())
+                );
+            }
+            FileProcessResult {
+                has_issues: false,
+                issues_found: 0,
+                content_changed: false,
+                summary_issues_fixed: 0,
+                fixable_issues: 0,
+                warnings: Vec::new(),
+                file_index: rumdl_lib::workspace_index::FileIndex::default(),
+                file_index_reused: false,
+                errored: true,
+                config_warning: false,
+            }
+        }
+    }
+}
+
+/// The message a panic carried, when it was a string.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panic with a non-string payload")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_file_with_formatter_inner(
+    file_path: &str,
+    rule_sets: &RuleSets,
+    fix_mode: crate::FixMode,
+    diff: bool,
+    verbose: bool,
+    quiet: bool,
+    silent: bool,
+    output_format: &rumdl_lib::output::OutputFormat,
+    output_writer: &rumdl_lib::output::OutputWriter,
+    config: &rumdl_config::Config,
+    cache: Option<std::sync::Arc<LintCache>>,
+    workspace_index: Option<std::sync::Arc<rumdl_lib::workspace_index::WorkspaceIndex>>,
+    project_root: Option<&Path>,
+    show_full_path: bool,
+    cache_hashes: Option<&CacheHashes>,
+    write_plan: Option<&super::PreflightPlan>,
+    format_only: bool,
+    check_only: bool,
+) -> FileProcessResult {
+    let formatter = std::cell::LazyCell::new(|| output_format.create_formatter());
+
+    // The same display path the batch formats show for this file: relative
+    // unless --show-full-path is set, normalized either way.
+    let display_path =
+        std::cell::LazyCell::new(|| resolve_discovered_display_path(file_path, show_full_path, project_root));
+
+    let ProcessFileResult {
+        warnings: all_warnings,
+        mut content,
+        total_warnings,
+        fixable_warnings,
+        line_ending_map,
+        file_index,
+        file_index_reused,
+        errored,
+        inline_config_warning,
+        lossy,
+        mut prepared_fix,
+        mut prepared_remaining_warnings,
+        format_stable,
+        format_probe_changed,
+    } = process_file_with_index(
+        file_path,
+        rule_sets,
+        verbose,
+        quiet,
+        silent,
+        config,
+        cache,
+        workspace_index,
+        cache_hashes,
+        (fix_mode != crate::FixMode::Check || diff) && write_plan.is_none(),
+        format_only,
+        check_only,
+    );
+
+    // The file could not be read: report it as a tool error (exit code 2) and
+    // do not treat the empty content as a clean, issue-free file.
+    if errored {
+        return FileProcessResult {
+            has_issues: false,
+            issues_found: 0,
+            content_changed: false,
+            summary_issues_fixed: 0,
+            fixable_issues: 0,
+            warnings: Vec::new(),
+            file_index,
+            file_index_reused,
+            errored: true,
+            config_warning: false,
+        };
+    }
+
+    if format_stable || format_probe_changed {
+        return FileProcessResult {
+            has_issues: format_probe_changed,
+            issues_found: 0,
+            content_changed: format_probe_changed,
+            summary_issues_fixed: 0,
+            fixable_issues: 0,
+            warnings: Vec::new(),
+            file_index,
+            file_index_reused,
+            errored: false,
+            config_warning: inline_config_warning,
+        };
+    }
+
+    if let Some(plan) = write_plan {
+        plan.record_diagnostics(
+            Path::new(file_path),
+            warnings_for_output(all_warnings.clone(), output_format, &line_ending_map),
+        );
+    }
+
+    // A fatal lint/coverage failure cannot become a successful plan merely
+    // because a subsequent formatter or re-lint happens to succeed.
+    if write_plan.is_some()
+        && all_warnings.iter().any(|warning| {
+            warning.severity == rumdl_lib::rule::Severity::Error
+                && warning.rule_name.as_deref() == Some("code-block-tools")
+        })
+    {
+        return FileProcessResult {
+            has_issues: true,
+            issues_found: total_warnings,
+            content_changed: false,
+            summary_issues_fixed: 0,
+            fixable_issues: fixable_warnings,
+            warnings: all_warnings,
+            file_index,
+            file_index_reused,
+            errored: true,
+            config_warning: inline_config_warning,
+        };
+    }
+
+    // A file that is not valid UTF-8 is reported but never fixed or written: its
+    // content is a lossy decoding, not the bytes on disk. A merge conflict
+    // protects the whole document the same way.
+    if lossy
+        || config
+            .code_block_tools
+            .run_state
+            .as_ref()
+            .is_some_and(|state| state.aborted())
+        || rumdl_lib::merge_conflict::detect_for_rules(
+            &content,
+            &rule_sets.selected,
+            config,
+            Some(Path::new(file_path)),
+        )
+        .is_some()
+    {
+        if !output_format.is_batch() && !all_warnings.is_empty() {
+            let formatted = formatter.format_warnings_with_content(&all_warnings, &display_path, &content);
+            // Report it where this run reports its findings, so `--stderr` and
+            // `--silent` reach it like any other. The exception is a preview
+            // whose stdout is an applyable patch and nothing else: a notice
+            // about a file it leaves alone belongs beside that patch, not in it.
+            // `check --diff` is the human report that lists both, so it keeps
+            // the notice with its findings.
+            let stdout_is_a_patch = diff && fix_mode != crate::FixMode::Check && output_format.carries_diff();
+            let written = if stdout_is_a_patch {
+                output_writer.write_error(&formatted)
+            } else {
+                output_writer.writeln(&formatted)
+            };
+            written.unwrap_or_else(|e| {
+                eprintln!("Error writing output: {e}");
+            });
+        }
+        return FileProcessResult {
+            has_issues: total_warnings > 0,
+            issues_found: total_warnings,
+            content_changed: false,
+            summary_issues_fixed: 0,
+            fixable_issues: 0,
+            warnings: all_warnings,
+            file_index,
+            file_index_reused,
+            errored: write_plan.is_some()
+                || (fix_mode != crate::FixMode::Check
+                    && config
+                        .code_block_tools
+                        .run_state
+                        .as_ref()
+                        .is_some_and(|state| state.aborted())),
+            config_warning: inline_config_warning,
+        };
+    }
+
+    // The rules this document configures itself, which is what decides whether its
+    // warnings carry a fix the CLI will apply.
+    let document_rules = rules_reconfigured_by_document(&rule_sets.document, config, strip_bom(&content));
+
+    // Compute filtered rules based on per-file-ignores. The fix coordinator, embedded
+    // markdown formatting, and Rust doc-comment formatting all run against this set so
+    // `fmt` never applies a per-file-ignored rule - matching what linting already does.
+    // Passing the unfiltered `rules` here would let the coordinator re-check and re-fix
+    // an ignored rule as a side effect of fixing a non-ignored one (issue #707).
+    let ignored_rules_for_file = config.get_ignored_rules_for_file(Path::new(file_path));
+    let filtered_rule_sets = rule_sets.for_file(&ignored_rules_for_file);
+
+    // In check mode with no warnings, return early
+    if total_warnings == 0 && fix_mode == crate::FixMode::Check && !diff {
+        return FileProcessResult {
+            has_issues: false,
+            issues_found: 0,
+            content_changed: false,
+            summary_issues_fixed: 0,
+            fixable_issues: 0,
+            warnings: Vec::new(),
+            file_index,
+            file_index_reused,
+            errored: false,
+            config_warning: inline_config_warning,
+        };
+    }
+
+    // A prepared formatting result can exist without a diagnostic report. With
+    // neither a report nor a prepared result, only auxiliary work can change it.
+    if total_warnings == 0 && fix_mode != crate::FixMode::Check && prepared_fix.is_none() {
+        // Check if there's any embedded markdown to format
+        let has_embedded = rule_sets.auxiliary.format
+            && !filtered_rule_sets.embedded_markdown.is_empty()
+            && has_fenced_code_blocks(strip_bom(&content))
+            && markdown_code_blocks(strip_bom(&content))
+                .iter()
+                .any(|block| !block.code.trim().is_empty());
+
+        // Check if code block tools are enabled
+        let has_code_block_tools =
+            rule_sets.auxiliary.format && config.code_block_tools.enabled && !is_rust_source(Path::new(file_path));
+
+        if !has_embedded && !has_code_block_tools {
+            return FileProcessResult {
+                has_issues: false,
+                issues_found: 0,
+                content_changed: false,
+                summary_issues_fixed: 0,
+                fixable_issues: 0,
+                warnings: Vec::new(),
+                file_index,
+                file_index_reused,
+                errored: false,
+                config_warning: inline_config_warning,
+            };
+        }
+    }
+
+    // Format and output warnings (show diagnostics unless silent). A diff lists
+    // the findings it leaves unfixed, which are known once its fixes are made. A
+    // format with no room for a diff lists every finding here, whichever command
+    // previews it.
+    let lists_every_finding = if diff {
+        !output_format.carries_diff()
+    } else {
+        fix_mode == crate::FixMode::Check
+    };
+    if !silent && lists_every_finding {
+        // In check mode, show all warnings with [*] for fixable issues
+        // Strip fix from warnings where the rule is not CLI-fixable (e.g., LSP-only fixes)
+        let display_warnings: Vec<_> = all_warnings
+            .iter()
+            .map(|w| {
+                let rule_name = w.rule_name.as_deref().unwrap_or("");
+                if !is_rule_cli_fixable_in(&rule_sets.document, &document_rules, config, rule_name) {
+                    LintWarning { fix: None, ..w.clone() }
+                } else {
+                    w.clone()
+                }
+            })
+            .collect();
+        let formatted = formatter.format_warnings_with_content(&display_warnings, &display_path, &content);
+        if !formatted.is_empty() {
+            output_writer.writeln(&formatted).unwrap_or_else(|e| {
+                eprintln!("Error writing output: {e}");
+            });
+        }
+    }
+
+    // Handle diff mode or fix mode
+    if diff {
+        // In diff mode, apply fixes to a copy and show diff
+        let original_content = content.clone();
+        let document_changed = if let Some(prepared) = prepared_fix.take() {
+            finish_fix_run(prepared, &mut content, true, Some(Path::new(file_path)), None)
+        } else {
+            apply_document_fixes(
+                &filtered_rule_sets.document,
+                &mut content,
+                true,
+                true,
+                config,
+                Some(Path::new(file_path)),
+            )
+        };
+        // A diff is a preview and writes nothing, but an external formatter that
+        // could not run is a fact about this run either way, so `--silent` is what
+        // decides whether the user hears about it.
+        let auxiliary = apply_auxiliary_fixes(
+            &mut content,
+            file_path,
+            &display_path,
+            &filtered_rule_sets,
+            config,
+            silent,
+        );
+        let blocks_formatted = auxiliary.blocks_formatted;
+        if blocks_formatted > 0 {
+            prepared_remaining_warnings = None;
+        }
+        let tool_failed = auxiliary.tool_failed();
+
+        let aborted = config
+            .code_block_tools
+            .run_state
+            .as_ref()
+            .is_some_and(|state| state.aborted());
+        if aborted {
+            content.clone_from(&original_content);
+        }
+        let content_changed = !aborted && (document_changed || blocks_formatted > 0);
+
+        // Which findings the diff resolves, read from the document it produces:
+        // a rule can fix without attaching a fix to its finding, and one
+        // configured as unfixable attaches a fix the run never applies.
+        let reconciliation = (total_warnings > 0).then(|| {
+            let remaining_warnings = remaining_after_fixes(
+                &content,
+                file_path,
+                &filtered_rule_sets,
+                config,
+                &all_warnings,
+                content_changed,
+                prepared_remaining_warnings.take(),
+            );
+            reconcile_fixed_warnings(&all_warnings, &remaining_warnings, &original_content, &content)
+        });
+
+        if !silent
+            && fix_mode == crate::FixMode::Check
+            && output_format.carries_diff()
+            && let Some(reconciliation) = &reconciliation
+        {
+            let unfixed = reconciliation.unfixed(&all_warnings);
+            if !unfixed.is_empty() {
+                let formatted = formatter.format_warnings_with_content(&unfixed, &display_path, &original_content);
+                if !formatted.is_empty() {
+                    output_writer.writeln(&formatted).unwrap_or_else(|e| {
+                        eprintln!("Error writing output: {e}");
+                    });
+                }
+            }
+        }
+
+        // OutputWriter suppresses all silent output, including diffs.
+        if content_changed && output_format.carries_diff() && !silent {
+            // The diff runs from the bytes on disk to the bytes a fix would write,
+            // line endings included, so applying it produces what `fmt` writes. It
+            // ends in a newline, so consecutive files' diffs concatenate into one
+            // patch the way `diff -u` and `git diff` print them.
+            let on_disk = line_ending_map.restore(&original_content);
+            let fixed = line_ending_map.restore_fixed(&original_content, &content);
+            let diff_output = formatter::generate_diff(&on_disk, &fixed, &display_path);
+            output_writer.write(&diff_output).unwrap_or_else(|e| {
+                eprintln!("Error writing diff output: {e}");
+            });
+        }
+
+        // Formatting-only changes are not lint findings. Count resolved warnings
+        // separately from changed files so summaries cannot say "1/0 issues".
+        let summary_issues_fixed = reconciliation.map_or(0, |reconciliation| reconciliation.fixed_count());
+
+        // Don't actually write the file in diff mode, but report how many would be fixed
+        return FileProcessResult {
+            has_issues: total_warnings > 0 || content_changed,
+            issues_found: total_warnings,
+            content_changed,
+            summary_issues_fixed,
+            fixable_issues: fixable_warnings,
+            warnings: warnings_for_output(
+                with_tool_failures(all_warnings, auxiliary.tool_failures),
+                output_format,
+                &line_ending_map,
+            ),
+            file_index,
+            file_index_reused,
+            errored: tool_failed,
+            config_warning: inline_config_warning,
+        };
+    } else if fix_mode != crate::FixMode::Check {
+        let original_content = content.clone();
+        // Apply fixes using Fix Coordinator
+        let document_changed = if let Some(prepared) = prepared_fix.take() {
+            finish_fix_run(prepared, &mut content, silent, Some(Path::new(file_path)), None)
+        } else if write_plan.is_some() {
+            match plan_document_fixes(&filtered_rule_sets.document, &mut content, config, Path::new(file_path)) {
+                Ok(changed) => changed,
+                Err(message) => {
+                    return FileProcessResult {
+                        has_issues: true,
+                        issues_found: total_warnings + 1,
+                        content_changed: false,
+                        summary_issues_fixed: 0,
+                        fixable_issues: fixable_warnings,
+                        warnings: vec![
+                            super::PreflightFailure {
+                                path: PathBuf::from(file_path),
+                                message,
+                                written: 0,
+                            }
+                            .warning(),
+                        ],
+                        file_index,
+                        file_index_reused,
+                        errored: true,
+                        config_warning: inline_config_warning,
+                    };
+                }
+            }
+        } else {
+            apply_document_fixes(
+                &filtered_rule_sets.document,
+                &mut content,
+                quiet,
+                silent,
+                config,
+                Some(Path::new(file_path)),
+            )
+        };
+
+        let auxiliary = apply_auxiliary_fixes(
+            &mut content,
+            file_path,
+            &display_path,
+            &filtered_rule_sets,
+            config,
+            silent,
+        );
+        let blocks_formatted = auxiliary.blocks_formatted;
+        if blocks_formatted > 0 {
+            prepared_remaining_warnings = None;
+        }
+        let mut tool_failed = auxiliary.tool_failed();
+
+        let aborted = config
+            .code_block_tools
+            .run_state
+            .as_ref()
+            .is_some_and(|state| state.aborted());
+        if aborted {
+            content.clone_from(&original_content);
+        }
+        let mut content_changed = !aborted && (document_changed || blocks_formatted > 0);
+
+        // Write fixed content back to file
+        if content_changed {
+            // Denormalize back to original line ending before writing
+            let content_to_write = line_ending_map.restore_fixed(&original_content, &content).into_owned();
+
+            // Write atomically (temp file + rename) so an interrupted or failed
+            // write can never truncate the user's file: the original is only
+            // ever replaced wholesale, never edited in place.
+            if let Some(plan) = write_plan {
+                plan.stage(Path::new(file_path), content_to_write.into_bytes());
+            } else if let Err(err) =
+                rumdl_lib::utils::atomic_write::write_atomically(Path::new(file_path), content_to_write.as_bytes())
+            {
+                tool_failed = true;
+                content_changed = false;
+                content.clone_from(&original_content);
+                if !silent {
+                    eprintln!(
+                        "{} Failed to write fixed content to file {}: {}",
+                        "Error:".red().bold(),
+                        file_path,
+                        err
+                    );
+                }
+            }
+        }
+
+        // A silent formatting request has no diagnostic report to reconcile.
+        // An initially clean document can also reach here after embedded changes.
+        // Both paths can return the formatting and tool status directly.
+        if total_warnings == 0 {
+            return FileProcessResult {
+                has_issues: false,
+                issues_found: 0,
+                content_changed,
+                summary_issues_fixed: 0,
+                fixable_issues: 0,
+                // The document itself was clean, so a tool that could not run is
+                // the only thing this file has to report. Without it a JSON or
+                // SARIF consumer sees an empty list and reads the run as clean.
+                warnings: warnings_for_output(auxiliary.tool_failures, output_format, &line_ending_map),
+                file_index,
+                file_index_reused,
+                errored: tool_failed,
+                config_warning: inline_config_warning,
+            };
+        }
+
+        // Re-lint the fixed content to see which warnings remain.
+        let remaining_warnings = remaining_after_fixes(
+            &content,
+            file_path,
+            &filtered_rule_sets,
+            config,
+            &all_warnings,
+            content_changed,
+            prepared_remaining_warnings.take(),
+        );
+
+        let reconciliation = reconcile_fixed_warnings(&all_warnings, &remaining_warnings, &original_content, &content);
+        let summary_issues_fixed = reconciliation.fixed_count();
+
+        // Show fix results in streaming output
+        if !silent {
+            use rumdl_lib::output::OutputFormat;
+            match output_format {
+                // Human-readable text formats: show what was fixed alongside what is
+                // left. A fixed warning is reported where it was, since that is the
+                // only place it ever existed; everything else is reported from the
+                // re-lint, so its position belongs to the file now on disk.
+                OutputFormat::Text | OutputFormat::Full => {
+                    let mut entries: Vec<(&LintWarning, bool)> = all_warnings
+                        .iter()
+                        .zip(reconciliation.per_warning())
+                        .filter(|&(_, &was_fixed)| was_fixed)
+                        .map(|(warning, _)| (warning, true))
+                        .chain(remaining_warnings.iter().map(|warning| (warning, false)))
+                        .collect();
+                    entries.sort_by_key(|(warning, _)| (warning.line, warning.column));
+
+                    let mut output = String::new();
+                    for (warning, was_fixed) in entries {
+                        let rule_name = warning.rule_name.as_deref().unwrap_or("unknown");
+
+                        let fix_indicator = if was_fixed {
+                            " [fixed]".green().to_string()
+                        } else {
+                            String::new()
+                        };
+
+                        let line = format!(
+                            "{}:{}:{}: {} {}{}",
+                            display_path.blue().underline(),
+                            warning.line.to_string().cyan(),
+                            warning.column.to_string().cyan(),
+                            format!("[{rule_name:5}]").yellow(),
+                            warning.message,
+                            fix_indicator
+                        );
+
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+
+                    if !output.is_empty() {
+                        output.pop(); // Remove trailing newline
+                        output_writer.writeln(&output).unwrap_or_else(|e| {
+                            eprintln!("Error writing output: {e}");
+                        });
+                    }
+                }
+                // Batch formats are handled by check_runner (silent=true suppresses this path)
+                OutputFormat::Json | OutputFormat::GitLab | OutputFormat::Sarif | OutputFormat::Junit => {}
+                // Other streaming formats: use their formatter with remaining-only warnings
+                _ => {
+                    if !remaining_warnings.is_empty() {
+                        let formatted =
+                            formatter.format_warnings_with_content(&remaining_warnings, &display_path, &content);
+                        if !formatted.is_empty() {
+                            output_writer.writeln(&formatted).unwrap_or_else(|e| {
+                                eprintln!("Error writing output: {e}");
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Return remaining warnings for batch format collection
+        // Exit 0 if all violations are fixed (Ruff convention)
+        let fixed_line_ending_map = if content_changed {
+            let output_content = line_ending_map.restore_fixed(&original_content, &content);
+            rumdl_lib::utils::NormalizedLineEndingMap::new(&output_content)
+        } else {
+            line_ending_map.clone()
+        };
+
+        return FileProcessResult {
+            has_issues: !remaining_warnings.is_empty(),
+            issues_found: total_warnings,
+            content_changed,
+            summary_issues_fixed,
+            fixable_issues: fixable_warnings,
+            warnings: warnings_for_output(
+                with_tool_failures(remaining_warnings, auxiliary.tool_failures),
+                output_format,
+                &fixed_line_ending_map,
+            ),
+            file_index,
+            file_index_reused,
+            errored: tool_failed,
+            config_warning: inline_config_warning,
+        };
+    }
+
+    FileProcessResult {
+        has_issues: true,
+        issues_found: total_warnings,
+        content_changed: false,
+        summary_issues_fixed: 0,
+        fixable_issues: fixable_warnings,
+        warnings: warnings_for_output(all_warnings, output_format, &line_ending_map),
+        file_index,
+        file_index_reused,
+        errored: false,
+        config_warning: inline_config_warning,
+    }
+}
+
+/// Lint the fixed content to see which warnings remain.
+///
+/// `rule_sets` are the ones the fix pass ran, already filtered by per-file ignores.
+/// Going through the same entry point the pre-fix pass uses keeps the two sets of
+/// warnings comparable: inline config, kramdown blocks, severity overrides and the
+/// rules that report on a whole document are all handled identically.
+fn relint_fixed_file_content(
+    content: &str,
+    file_path: &str,
+    rule_sets: &RuleSets,
+    config: &rumdl_config::Config,
+) -> Vec<rumdl_lib::rule::LintWarning> {
+    // A Rust file is linted through the markdown in its doc comments and nothing
+    // else. Handing its source to the markdown linter reports on the Rust code
+    // itself, and those findings are not in the file: an `.rs` file whose doc
+    // comment was fixed gained an MD041 for its first line of code.
+    if is_rust_source(Path::new(file_path)) {
+        return rumdl_lib::doc_comment_lint::check_doc_comment_blocks(content, &rule_sets.document, config);
+    }
+
+    let flavor = config.get_flavor_for_file(Path::new(file_path));
+    let mut warnings = rumdl_lib::lint(
+        content,
+        &rule_sets.document,
+        false,
+        flavor,
+        Some(PathBuf::from(file_path)),
+        Some(config),
+    )
+    .unwrap_or_default();
+    let relint_plan = AuxiliaryExecutionPlan {
+        lint: rule_sets.auxiliary.relint,
+        format: false,
+        relint: false,
+    };
+    // The check pass already reported any tool that could not run, so the
+    // re-lint's own account of the same failure is not repeated.
+    warnings.extend(auxiliary_warnings(content, file_path, &rule_sets.embedded_markdown, relint_plan, config).warnings);
+    warnings
+}
+
+/// The warnings a file still has once its fix run is done.
+///
+/// A run that changed no bytes fixed nothing, so the file still says exactly what
+/// it was reported to say and the answer is already in hand. Asking again is a
+/// second full lint of every file a run left alone, external code-block tools
+/// included, to be told what it was told before the fix pass.
+fn remaining_after_fixes(
+    content: &str,
+    file_path: &str,
+    rule_sets: &RuleSets,
+    config: &rumdl_config::Config,
+    all_warnings: &[rumdl_lib::rule::LintWarning],
+    content_changed: bool,
+    prepared: Option<Vec<LintWarning>>,
+) -> Vec<rumdl_lib::rule::LintWarning> {
+    if content_changed {
+        if let Some(mut warnings) = prepared {
+            let relint_plan = AuxiliaryExecutionPlan {
+                lint: rule_sets.auxiliary.relint,
+                format: false,
+                relint: false,
+            };
+            warnings.extend(
+                auxiliary_warnings(content, file_path, &rule_sets.embedded_markdown, relint_plan, config).warnings,
+            );
+            warnings
+        } else {
+            relint_fixed_file_content(content, file_path, rule_sets, config)
+        }
+    } else {
+        all_warnings.to_vec()
+    }
+}
+
+/// What `apply_auxiliary_fixes` managed to do.
+#[derive(Default)]
+struct AuxiliaryFixOutcome {
+    /// Number of blocks that were rewritten.
+    blocks_formatted: usize,
+    /// The code-block tools that could not run under a setting of `fail`, as
+    /// diagnostics.
+    ///
+    /// The document was formatted only in part, so the run is a tool-level error
+    /// rather than a lint finding and exits 2. Saying it only on stderr leaves
+    /// `--output-format json` an empty list, which reads exactly like a clean
+    /// run; these go into the file's warnings so every output format carries the
+    /// fact, the same way the lint path already reports it. Messages collected
+    /// under `on-error = "warn"` are not here.
+    tool_failures: Vec<rumdl_lib::rule::LintWarning>,
+}
+
+impl AuxiliaryFixOutcome {
+    /// Whether part of this file went unformatted because a tool could not run.
+    fn tool_failed(&self) -> bool {
+        !self.tool_failures.is_empty()
+    }
+}
+
+/// Run the fixers that work beside the document's own fix pass.
+///
+/// The counterpart of `auxiliary_warnings`: one funnel per direction, so a source
+/// cannot be linted without being fixed or fixed without being linted.
+fn apply_auxiliary_fixes(
+    content: &mut String,
+    file_path: &str,
+    display_path: &str,
+    rule_sets: &RuleSets,
+    config: &rumdl_config::Config,
+    silent: bool,
+) -> AuxiliaryFixOutcome {
+    // The fixers read the text after the byte order mark and the mark is put back
+    // afterwards. Rust doc extraction handles the enclosing source's marker
+    // itself, preserving byte ranges in the Rust source.
+    let had_bom = !is_rust_source(Path::new(file_path)) && rumdl_lib::utils::bom::has_bom(content);
+    if had_bom {
+        content.remove(0);
+    }
+    let outcome = apply_auxiliary_fixes_to_analysis(content, file_path, display_path, rule_sets, config, silent);
+    if had_bom {
+        content.insert(0, rumdl_lib::utils::bom::BOM);
+    }
+    outcome
+}
+
+fn apply_auxiliary_fixes_to_analysis(
+    content: &mut String,
+    file_path: &str,
+    display_path: &str,
+    rule_sets: &RuleSets,
+    config: &rumdl_config::Config,
+    silent: bool,
+) -> AuxiliaryFixOutcome {
+    // Rust sources are treated solely as containers for Markdown doc comments.
+    // This is regular rumdl document formatting rather than a code-block tool,
+    // so `--no-code-block-tools` preserves it. Only mode supplies no document
+    // rules and therefore changes nothing. Never hand the Rust code itself to
+    // configured fenced-code tools.
+    if is_rust_source(Path::new(file_path)) {
+        return AuxiliaryFixOutcome {
+            blocks_formatted: super::doc_comments::format_doc_comment_blocks(content, &rule_sets.document, config),
+            tool_failures: Vec::new(),
+        };
+    }
+
+    if !rule_sets.auxiliary.format {
+        return AuxiliaryFixOutcome::default();
+    }
+
+    let mut blocks_formatted = 0;
+    let mut tool_failures = Vec::new();
+
+    // Formatting is opt-in through the format slot. The legacy lint = ["rumdl"]
+    // setting also enables it, preserving existing configurations.
+    // `embedded_markdown` respects per-file-ignores for the embedded content.
+    if !rule_sets.embedded_markdown.is_empty() && should_format_embedded_markdown(&config.code_block_tools) {
+        let outcome = format_embedded_markdown_blocks(content, &rule_sets.embedded_markdown, config);
+        blocks_formatted += outcome.formatted;
+        if !silent {
+            for refusal in &outcome.refused {
+                eprintln!("Warning: {display_path}:{}: {}", refusal.line, refusal.message);
+            }
+        }
+        tool_failures.extend(outcome.refused);
+    }
+
+    // Format code blocks using external tools if enabled
+    if config.code_block_tools.enabled {
+        let processor = rumdl_lib::code_block_tools::CodeBlockToolProcessor::new(
+            &config.code_block_tools,
+            config.get_flavor_for_file(Path::new(file_path)),
+        )
+        .with_document_config(config)
+        .for_path(Path::new(file_path))
+        .with_builtin_checks(!rule_sets.embedded_markdown.is_empty());
+        match processor.format_for_rules(content, &rule_sets.selected, config, Some(Path::new(file_path))) {
+            Ok(output) => {
+                if output.content != *content {
+                    *content = output.content;
+                    blocks_formatted += 1;
+                }
+                // Report any errors that occurred during formatting
+                if output.had_errors && !silent {
+                    for msg in &output.error_messages {
+                        eprintln!("Warning: {}", format_tool_warning(msg, display_path));
+                    }
+                }
+                tool_failures.extend(output.failures.iter().map(|d| d.to_lint_warning()));
+            }
+            // `format` only returns Err for the settings that ask to stop on the
+            // first failure (`fail-fast`, `on-error = "fail"`), so the document
+            // was left unformatted from that block onwards.
+            Err(e) => {
+                if !silent {
+                    eprintln!("Warning: {}", format_tool_error(&e, display_path));
+                }
+                // Reported at the block that stopped the run, exactly as the lint
+                // path reports the same error.
+                tool_failures.push(e.to_lint_warning());
+            }
+        }
+    }
+
+    AuxiliaryFixOutcome {
+        blocks_formatted,
+        tool_failures,
+    }
+}
+
+/// Add the format pass's tool failures to what this file reports.
+///
+/// A language configured with lint tools as well as format tools has the same
+/// missing binary reported by the lint pass, so an identical finding at the same
+/// place is already there and is not repeated.
+fn with_tool_failures(
+    mut warnings: Vec<rumdl_lib::rule::LintWarning>,
+    failures: Vec<rumdl_lib::rule::LintWarning>,
+) -> Vec<rumdl_lib::rule::LintWarning> {
+    for failure in failures {
+        let already_reported = warnings
+            .iter()
+            .any(|w| w.line == failure.line && w.message == failure.message && w.rule_name == failure.rule_name);
+        if !already_reported {
+            warnings.push(failure);
+        }
+    }
+    warnings
+}
+
+/// The warnings a file has from the sources beside its own document lint.
+///
+/// Markdown embedded in a fenced code block, and a code block handed to an
+/// external tool, each produce findings `rumdl_lib::lint` knows nothing about.
+/// The check pass adds both, so the re-lint a fix run reconciles against has to
+/// add them on the same terms: a source present on one side and missing on the
+/// other is a warning that leaves the report without anyone having fixed it.
+fn auxiliary_warnings(
+    content: &str,
+    file_path: &str,
+    embedded_markdown_rules: &[Box<dyn Rule>],
+    plan: AuxiliaryExecutionPlan,
+    config: &rumdl_config::Config,
+) -> AuxiliaryLint {
+    if !plan.lint || is_rust_source(Path::new(file_path)) {
+        return AuxiliaryLint::default();
+    }
+
+    // Embedded blocks and tools read the text after the byte order mark.
+    let content = strip_bom(content);
+    let mut warnings = Vec::new();
+    let mut tool_warnings = Vec::new();
+    let mut tool_failed = false;
+
+    // An embedded block is part of this file, so its findings are this file's and
+    // the caller's per-file-ignores decides which of them are reported.
+    if !embedded_markdown_rules.is_empty() && should_lint_embedded_markdown(&config.code_block_tools) {
+        warnings.extend(rumdl_lib::time_function!(
+            "file: embedded markdown blocks",
+            check_embedded_markdown_blocks(content, embedded_markdown_rules, config)
+        ));
+    }
+
+    if config.code_block_tools.enabled {
+        rumdl_lib::time_section!("file: code block tools", {
+            let processor = rumdl_lib::code_block_tools::CodeBlockToolProcessor::new(
+                &config.code_block_tools,
+                config.get_flavor_for_file(Path::new(file_path)),
+            )
+            .with_document_config(config)
+            .for_path(Path::new(file_path))
+            .with_builtin_checks(!embedded_markdown_rules.is_empty());
+            match processor.lint_output(content) {
+                Ok(output) => {
+                    warnings.extend(output.diagnostics.iter().map(|d| d.to_lint_warning()));
+                    tool_warnings = output.warnings;
+                    tool_failed = output.incomplete;
+                }
+                // A `fail-fast` setting stopped the document. Reported as a finding
+                // so it counts toward the exit code.
+                Err(e) => {
+                    warnings.push(e.to_lint_warning());
+                    tool_failed = true;
+                }
+            }
+        });
+    }
+
+    AuxiliaryLint {
+        warnings,
+        tool_warnings,
+        tool_failed,
+    }
+}
+
+/// What the sources beside the document lint had to say about a file.
+#[derive(Default)]
+struct AuxiliaryLint {
+    /// Findings, reported and counted like the document's own.
+    warnings: Vec<rumdl_lib::rule::LintWarning>,
+    /// Code-block tools that could not run under `on-error = "warn"`, in the form
+    /// [`format_tool_warning`] turns into a line for the reader. Not findings.
+    tool_warnings: Vec<String>,
+    /// Whether a code-block tool could not run, leaving a block unchecked.
+    tool_failed: bool,
+}
+
+/// Result type for file processing that includes index data for cross-file analysis
+pub struct ProcessFileResult {
+    pub warnings: Vec<rumdl_lib::rule::LintWarning>,
+    pub content: String,
+    pub total_warnings: usize,
+    pub fixable_warnings: usize,
+    pub line_ending_map: rumdl_lib::utils::NormalizedLineEndingMap,
+    pub file_index: rumdl_lib::workspace_index::FileIndex,
+    pub file_index_reused: bool,
+    /// The file could not be read (missing, unreadable, or not valid UTF-8).
+    /// A tool-level error, not a lint finding: it must surface as exit code 2.
+    pub errored: bool,
+    /// An inline disable comment referenced an unknown rule name.
+    pub inline_config_warning: bool,
+    /// The file is not valid UTF-8: `content` is a lossy decoding (or empty,
+    /// for a binary file), so nothing may be fixed or written back.
+    pub lossy: bool,
+    prepared_fix: Option<Result<(String, rumdl_lib::fix_coordinator::FixResult), String>>,
+    prepared_remaining_warnings: Option<Vec<LintWarning>>,
+    format_stable: bool,
+    /// A status-only formatter observed its first actual native rewrite. Its
+    /// temporary output is never used as a complete formatting result or cache.
+    format_probe_changed: bool,
+}
+
+pub struct CacheHashes {
+    pub config_hash: String,
+    pub rules_hash: String,
+    check_rules_hash: Option<String>,
+}
+
+impl CacheHashes {
+    pub fn new(config: &rumdl_config::Config, rule_sets: &RuleSets) -> Self {
+        Self {
+            config_hash: LintCache::hash_config(config),
+            rules_hash: Self::hash_rule_sets(rule_sets, config),
+            check_rules_hash: Self::hash_check_rule_sets(rule_sets, config),
+        }
+    }
+
+    /// The rules a result came from, and the tools when it came from any: a
+    /// code-block tool's verdict belongs to the binary that gave it, so a
+    /// different binary on `PATH` must not be answered from the cache.
+    fn hash_rule_sets(rule_sets: &RuleSets, config: &rumdl_config::Config) -> String {
+        Self::hash_rule_sets_with_plan(rule_sets, config, rule_sets.auxiliary)
+    }
+
+    // Check and format deliberately have separate tool-phase cache keys. With
+    // tools disabled, the same rule roles and configuration also let an empty
+    // check report seed a formatter fixed point, without replaying that report.
+    fn hash_check_rule_sets(rule_sets: &RuleSets, config: &rumdl_config::Config) -> Option<String> {
+        (!config.code_block_tools.enabled && rule_sets.auxiliary.format).then(|| {
+            Self::hash_rule_sets_with_plan(
+                rule_sets,
+                config,
+                AuxiliaryExecutionPlan {
+                    lint: rule_sets.auxiliary.lint,
+                    format: false,
+                    relint: false,
+                },
+            )
+        })
+    }
+
+    fn hash_rule_sets_with_plan(
+        rule_sets: &RuleSets,
+        config: &rumdl_config::Config,
+        auxiliary: AuxiliaryExecutionPlan,
+    ) -> String {
+        let tools = if auxiliary.lint {
+            rumdl_lib::code_block_tools::lint_tools_fingerprint(&config.code_block_tools)
+        } else {
+            String::new()
+        };
+        let material = format!(
+            // Invalidate pre-BOM-coordinate entries even for same-version development builds.
+            "code-block-tool-modes-v3\0{}\0{}\0{}\0{}\0{tools}",
+            rule_sets.mode.as_str(),
+            auxiliary.cache_key(),
+            LintCache::hash_rules(&rule_sets.document),
+            LintCache::hash_rules(&rule_sets.embedded_markdown),
+        );
+        blake3::hash(material.as_bytes()).to_hex().to_string()
+    }
+}
+
+// Every CLI rule comes from the built-in registry. MD051 and MD074 only report;
+// MD057 is the built-in formatter that can rewrite based on other files.
+fn formatting_has_filesystem_fixes(rules: &[Box<dyn Rule>], config: &rumdl_config::Config, content: &str) -> bool {
+    let overrides = rules_reconfigured_by_document(rules, config, content);
+    rules.iter().any(|rule| {
+        let effective = overrides
+            .iter()
+            .find(|other| other.name() == rule.name())
+            .unwrap_or(rule);
+        effective.as_any().is::<rumdl_lib::rules::MD057ExistingRelativeLinks>()
+            && effective.fix_capability() != FixCapability::Unfixable
+            && is_rule_actually_fixable(config, effective.name())
+    })
+}
+
+/// Process a file and return both warnings and FileIndex for cross-file aggregation
+#[allow(clippy::too_many_arguments)]
+pub fn process_file_with_index(
+    file_path: &str,
+    rule_sets: &RuleSets,
+    verbose: bool,
+    quiet: bool,
+    silent: bool,
+    config: &rumdl_config::Config,
+    cache: Option<std::sync::Arc<LintCache>>,
+    workspace_index: Option<std::sync::Arc<rumdl_lib::workspace_index::WorkspaceIndex>>,
+    cache_hashes: Option<&CacheHashes>,
+    prepare_fixes: bool,
+    format_only: bool,
+    check_only: bool,
+) -> ProcessFileResult {
+    use std::time::Instant;
+
+    let start_time = Instant::now();
+    if verbose && !quiet {
+        // Display a relative path for better UX. file_path is the canonical path
+        // discovery produced; the base is canonicalized when a raw strip fails,
+        // so it relativizes correctly on Windows where the discovered path
+        // carries a `\\?\` verbatim prefix and a long name while the cwd may be
+        // an 8.3 short name. It also normalizes separators to `/`.
+        let display_path = discovered_display_path(file_path, None);
+        println!("Processing file: {display_path}");
+    }
+
+    let empty_result = ProcessFileResult {
+        warnings: Vec::new(),
+        content: String::new(),
+        total_warnings: 0,
+        fixable_warnings: 0,
+        line_ending_map: rumdl_lib::utils::NormalizedLineEndingMap::default(),
+        file_index: rumdl_lib::workspace_index::FileIndex::new(),
+        file_index_reused: false,
+        errored: false,
+        // Inline-comment detection has not run at this point (the errored and
+        // empty-content early returns spread this template); those paths have no
+        // inline warning.
+        inline_config_warning: false,
+        lossy: false,
+        prepared_fix: None,
+        prepared_remaining_warnings: None,
+        format_stable: false,
+        format_probe_changed: false,
+    };
+
+    let bytes = match rumdl_lib::time_function!("file: read content", std::fs::read(file_path)) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => Err(error.to_string()),
+    };
+    // Invalid UTF-8 is linted from a lossy decoding and reported by MD094; a
+    // binary file gets MD094's single finding instead. A Rust source file is
+    // not Markdown, and one that is not UTF-8 is not Rust either.
+    let decoded = bytes.and_then(|bytes| match String::from_utf8(bytes) {
+        Err(error) if is_rust_source(Path::new(file_path)) => Err(error.utf8_error().to_string()),
+        decoded => Ok(decoded),
+    });
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            if !silent {
+                eprintln!("Error reading file {file_path}: Failed to read file {file_path}: {error}");
+            }
+            // A read failure is a tool error, not a clean result: flag it so
+            // the run exits with the tool-error code instead of reporting the
+            // file as having no issues.
+            return ProcessFileResult {
+                errored: true,
+                ..empty_result
+            };
+        }
+    };
+    let (content, invalid_utf8) = match decoded {
+        Ok(content) => (content, None),
+        Err(error) => match rumdl_lib::encoding::decode(error.as_bytes()) {
+            rumdl_lib::encoding::Decoded::Lossy { text, invalid } => (text, Some(invalid)),
+            rumdl_lib::encoding::Decoded::Binary { utf16 } => {
+                let warnings: Vec<_> = rumdl_lib::encoding::detect_binary_for_rules(
+                    utf16,
+                    &rule_sets.selected,
+                    config,
+                    Some(Path::new(file_path)),
+                )
+                .into_iter()
+                .collect();
+                return ProcessFileResult {
+                    total_warnings: warnings.len(),
+                    warnings,
+                    lossy: true,
+                    ..empty_result
+                };
+            }
+            rumdl_lib::encoding::Decoded::Utf8(_) => unreachable!("from_utf8 rejected these bytes"),
+        },
+    };
+    let lossy = invalid_utf8.is_some();
+    // The cache and index reuse key on the decoded text, which cannot tell two
+    // files apart whose invalid bytes differ, so a lossy file bypasses both.
+    let cache = if lossy { None } else { cache };
+
+    // Do this before normalization, caching, parsing, or invoking external tools.
+    let conflict_scan = rumdl_lib::merge_conflict::ConflictScan::new(content);
+    if let Some(conflict) = conflict_scan.detect_for_rules(&rule_sets.selected, config, Some(Path::new(file_path))) {
+        return ProcessFileResult {
+            warnings: vec![conflict],
+            total_warnings: 1,
+            content: conflict_scan.into_content().into_owned(),
+            ..empty_result
+        };
+    }
+
+    // Detect original line ending and retain a mapping back to the original
+    // byte boundaries before any processing.
+    let line_ending_map = rumdl_lib::utils::NormalizedLineEndingMap::new(conflict_scan.content());
+
+    // Normalize to LF for all internal processing
+    let conflict_scan = rumdl_lib::time_function!("file: normalize line endings", conflict_scan.normalize_lf());
+    let content = conflict_scan.content();
+
+    // Route Rust files to doc comment linting instead of regular markdown linting
+    if is_rust_source(Path::new(file_path)) {
+        return process_rust_file_doc_comments(file_path, content, &rule_sets.document, config, line_ending_map);
+    }
+
+    // The rules per-file-ignores takes away for this file. Resolved here rather
+    // than at the filtering site below because the inline-config validation
+    // needs it too, and that runs ahead of the cache lookup.
+    let ignored_rules_for_file = config.get_ignored_rules_for_file(Path::new(file_path));
+
+    // A mode that drops the outer document's rules does not drop MD094: a file
+    // whose bytes are not UTF-8 is owed that finding whatever else this run is
+    // doing, the way the binary branch above owes it from `selected`. Decided
+    // here because the inline-config validation below has to agree with the rule
+    // set the lint pass gets, or it warns that an enable of an active rule does
+    // nothing.
+    let restore_encoding_guard =
+        lossy && rumdl_lib::encoding::guard_missing_from_document_rules(&rule_sets.selected, &rule_sets.document);
+
+    // Detect unknown rule names in inline disable comments. The result feeds the
+    // exit code under --deny-config-warnings, so it is computed even when
+    // --silent suppresses the printed notices.
+    let inline_config_warning = rumdl_lib::time_section!("file: validate inline config", {
+        if !rumdl_lib::inline_config::has_inline_config_markers(content) {
+            false
+        } else {
+            // The document's own flavor decides what its indentation means, so a
+            // directive in a container body is judged as the configuration it is.
+            let flavor = config.get_flavor_for_file(Path::new(file_path));
+            // Inline enables may affect configured fenced Markdown as well
+            // as the outer document. Validate both against one source reading.
+            let mut active_rules = rule_sets.configuration_relevant_rule_names(config);
+            if restore_encoding_guard {
+                active_rules.insert(rumdl_lib::encoding::RULE_NAME.to_string());
+            }
+            let inline_warnings = rumdl_lib::inline_config::validate_inline_configuration(
+                strip_bom(content),
+                flavor,
+                &active_rules,
+                &ignored_rules_for_file,
+            );
+            let had_any = !inline_warnings.is_empty();
+            if !silent {
+                // The same relative form the findings for this file carry, so both
+                // name the file the way the user typed it.
+                let display_path = discovered_display_path(file_path, None);
+                for warn in inline_warnings {
+                    warn.print_warning(&display_path);
+                }
+            }
+            had_any
+        }
+    });
+
+    // Early content analysis for ultra-fast skip decisions
+    if content.is_empty() {
+        return ProcessFileResult {
+            line_ending_map,
+            ..empty_result
+        };
+    }
+
+    // The CLI requests this only for silent formatting with registry-built rules,
+    // no statistics/preflight, and no auxiliary tools. Guards and configuration
+    // validation above remain unconditional. Never populate the lint cache from
+    // formatting alone: it does not contain the diagnostics that cache promises.
+    // Kramdown extension blocks suppress reports before the existing fix gate.
+    // Preserve that gate for these documents, including unclosed extensions.
+    let preserve_report_gate = format_only
+        && config
+            .get_flavor_for_file(Path::new(file_path))
+            .supports_kramdown_syntax()
+        && content.contains("{:");
+    if format_only && prepare_fixes && !lossy && !preserve_report_gate {
+        let filtered;
+        let rules = if ignored_rules_for_file.is_empty() {
+            &rule_sets.document
+        } else {
+            // Excluded rules must leave the dependency graph too, matching the
+            // normal formatter's ordering of the rules that remain.
+            filtered = rule_sets.for_file(&ignored_rules_for_file);
+            &filtered.document
+        };
+        // Lint reports and formatting fixed points have different consumers.
+        // Never let a format-only result populate the ordinary diagnostic cache.
+        // MD057 can rewrite from filesystem state; inline settings can enable it.
+        let format_hashes = cache.as_ref().and_then(|_| {
+            (!formatting_has_filesystem_fixes(rules, config, content)).then(|| match cache_hashes {
+                Some(hashes) => (
+                    Cow::Borrowed(hashes.config_hash.as_str()),
+                    Cow::Borrowed(hashes.rules_hash.as_str()),
+                ),
+                None => (
+                    Cow::Owned(LintCache::hash_config(config)),
+                    Cow::Owned(CacheHashes::hash_rule_sets(rule_sets, config)),
+                ),
+            })
+        });
+        if let (Some(cache), Some((config_hash, rules_hash))) = (&cache, &format_hashes) {
+            let file_hash = LintCache::hash_content(content);
+            let stable = cache.format_is_stable(file_path, &file_hash, config_hash, rules_hash);
+            // A preceding check may already have done all this work. A complete
+            // empty report also takes the existing formatter's no-work gate.
+            // Filesystem-dependent fixes were excluded above; report-only
+            // findings cannot change the bytes this request consumes.
+            let accepts_source = |source: Option<&str>| {
+                source.is_some_and(|source| {
+                    source == file_path
+                        || (config.per_file_ignores.is_empty()
+                            && config.per_file_flavor.is_empty()
+                            && config.get_flavor_for_file(Path::new(source))
+                                == config.get_flavor_for_file(Path::new(file_path)))
+                })
+            };
+            let checked_clean = !stable
+                && (cache.has_empty_lint_report(&file_hash, config_hash, rules_hash, accepts_source) || {
+                    let check_hash = match cache_hashes {
+                        Some(hashes) => hashes.check_rules_hash.as_deref().map(Cow::Borrowed),
+                        None => CacheHashes::hash_check_rule_sets(rule_sets, config).map(Cow::Owned),
+                    };
+                    check_hash
+                        .is_some_and(|hash| cache.has_empty_lint_report(&file_hash, config_hash, &hash, accepts_source))
+                });
+            if stable || checked_clean {
+                return ProcessFileResult {
+                    content: conflict_scan.into_content().into_owned(),
+                    line_ending_map,
+                    inline_config_warning,
+                    format_stable: true,
+                    ..empty_result
+                };
+            }
+        }
+        let mut fixed = content.to_owned();
+        let coordinator = rumdl_lib::fix_coordinator::FixCoordinator::for_formatter();
+        let result = coordinator.apply_fixes_iterative(
+            rules,
+            &[],
+            &mut fixed,
+            config,
+            if check_only { 1 } else { 100 },
+            Some(Path::new(file_path)),
+        );
+        // The existing CLI counts a file as changed whenever a native rewrite
+        // was applied, including cycles that return to the original bytes. The
+        // first iteration either sees every rule unchanged or applies the first
+        // real rewrite in the exact native order. A silent status consumer needs
+        // no later text or convergence report. Never cache the partial output.
+        if check_only && result.as_ref().is_ok_and(|result| !result.fixed_rule_names.is_empty()) {
+            return ProcessFileResult {
+                content: conflict_scan.into_content().into_owned(),
+                line_ending_map,
+                inline_config_warning,
+                format_probe_changed: true,
+                ..empty_result
+            };
+        }
+        if let (Some(cache), Some((config_hash, rules_hash)), Ok(result)) = (&cache, &format_hashes, &result)
+            && result.converged
+            && !formatting_has_filesystem_fixes(rules, config, &fixed)
+        {
+            cache.set_format_stable(file_path, &LintCache::hash_content(&fixed), config_hash, rules_hash);
+        }
+        return ProcessFileResult {
+            content: conflict_scan.into_content().into_owned(),
+            line_ending_map,
+            inline_config_warning,
+            prepared_fix: Some(result.map(|result| (fixed, result))),
+            ..empty_result
+        };
+    }
+
+    // The rules this document configures itself, which is what decides whether its
+    // warnings carry a fix the CLI will apply.
+    let document_rules = rules_reconfigured_by_document(&rule_sets.document, config, strip_bom(content));
+
+    // External-tool verdicts share this entry with Markdown findings. Their
+    // effective dependencies are not known, so run them fresh even when the
+    // document and rumdl configuration have not changed.
+    let cache = if cache.is_some() && config.code_block_tools.enabled && rule_sets.auxiliary.lint {
+        let processor = rumdl_lib::code_block_tools::CodeBlockToolProcessor::new(
+            &config.code_block_tools,
+            config.get_flavor_for_file(Path::new(file_path)),
+        )
+        .with_document_config(config);
+        if processor.has_external_lint_work(strip_bom(content)) {
+            None
+        } else {
+            cache
+        }
+    } else {
+        cache
+    };
+
+    // Compute hashes for cache (Ruff-style: file content + config + enabled rules).
+    // Only the cache reads them. Executable fingerprints use the configured
+    // lookup preferences; uncached processing avoids these per-file hashes.
+    let (config_hash, rules_hash) = match (cache_hashes, &cache) {
+        (Some(hashes), _) => (Cow::Borrowed(&hashes.config_hash), Cow::Borrowed(&hashes.rules_hash)),
+        (None, Some(_)) => (
+            Cow::Owned(LintCache::hash_config(config)),
+            Cow::Owned(CacheHashes::hash_rule_sets(rule_sets, config)),
+        ),
+        (None, None) => (Cow::Owned(String::new()), Cow::Owned(String::new())),
+    };
+    let file_hash = LintCache::hash_content(content);
+    let md057_rule = if ignored_rules_for_file.contains("MD057") {
+        None
+    } else {
+        rule_sets.document.iter().find_map(|rule| {
+            rule.as_any()
+                .downcast_ref::<rumdl_lib::rules::MD057ExistingRelativeLinks>()
+        })
+    };
+
+    // Try to get from cache first (lock briefly for cache read)
+    // Note: Cache only stores single-file warnings; cross-file checks must run fresh
+    if let Some(ref cache_arc) = cache {
+        let flavor = config.get_flavor_for_file(Path::new(file_path));
+        // Discovery already canonicalized file_path, matching the index keys.
+        let canonical_path = PathBuf::from(file_path);
+        let cached_file_index = workspace_index
+            .as_deref()
+            .and_then(|index| index.get_file(&canonical_path))
+            .filter(|cached| cached.content_hash == file_hash);
+        let dependency_fingerprint = md057_rule.map(|rule| {
+            cached_file_index
+                .map(|file_index| rule.cache_dependency_fingerprint(Path::new(file_path), flavor, file_index))
+        });
+        let dependency_state = match dependency_fingerprint.as_ref() {
+            None => DependencyFingerprint::NotRequired,
+            Some(None) => DependencyFingerprint::Unavailable,
+            Some(Some(fingerprint)) => DependencyFingerprint::Current(fingerprint),
+        };
+        match rumdl_lib::time_function!(
+            "cache: lookup total",
+            cache_arc.get_with_reason_for_hash_and_dependencies(
+                &file_hash,
+                &config_hash,
+                &rules_hash,
+                dependency_state,
+            )
+        ) {
+            Ok(cached_warnings) => {
+                if let Some(state) = &config.code_block_tools.run_state {
+                    let processor =
+                        rumdl_lib::code_block_tools::CodeBlockToolProcessor::new(&config.code_block_tools, flavor)
+                            .with_document_config(config)
+                            .for_path(Path::new(file_path))
+                            .with_builtin_checks(
+                                !rule_sets.for_file(&ignored_rules_for_file).embedded_markdown.is_empty(),
+                            );
+                    if config.code_block_tools.enabled && rule_sets.auxiliary.lint {
+                        processor.replay_cached_warnings(strip_bom(content));
+                        if processor.has_lint_work(strip_bom(content)) {
+                            state.record_cached_check();
+                        }
+                    }
+                }
+                if verbose && !quiet {
+                    println!("Cache hit for {file_path}");
+                }
+                // Count fixable warnings from cache (using capability-based check)
+                let fixable_warnings = rumdl_lib::time_function!(
+                    "cache hit: count fixable warnings",
+                    cached_warnings
+                        .iter()
+                        .filter(|w| {
+                            w.fix.is_some()
+                                && w.rule_name.as_ref().is_some_and(|name| {
+                                    is_rule_cli_fixable_in(&rule_sets.document, &document_rules, config, name)
+                                })
+                        })
+                        .count()
+                );
+
+                // Build FileIndex for cross-file analysis on cache hit (lightweight, no rule checking)
+                let (file_index, file_index_reused) = if let Some(file_index) = cached_file_index {
+                    (file_index.clone(), true)
+                } else {
+                    (
+                        rumdl_lib::time_function!(
+                            "cache hit: build file index",
+                            rumdl_lib::build_file_index_only_for_selection(
+                                content,
+                                &rule_sets.document,
+                                flavor,
+                                Some(std::path::PathBuf::from(file_path)),
+                                config,
+                            )
+                        ),
+                        false,
+                    )
+                };
+
+                let total_warnings = cached_warnings.len();
+                return ProcessFileResult {
+                    warnings: cached_warnings,
+                    content: conflict_scan.into_content().into_owned(),
+                    total_warnings,
+                    fixable_warnings,
+                    line_ending_map,
+                    file_index,
+                    file_index_reused,
+                    errored: false,
+                    inline_config_warning,
+                    lossy: false,
+                    prepared_fix: None,
+                    prepared_remaining_warnings: None,
+                    format_stable: false,
+                    format_probe_changed: false,
+                };
+            }
+            Err(reason) => {
+                if verbose && !quiet {
+                    println!("Cache miss for {file_path}: {reason}");
+                }
+            }
+        }
+    }
+
+    let lint_start = Instant::now();
+
+    // Use lint_and_index for single-file linting + index contribution.
+    //
+    // The full rule set goes in: `lint_and_index` applies this file's
+    // per-file-ignores to what it reports, and keeps every cross-file rule for the
+    // index it builds. Handing it a pre-filtered set instead erased this file's
+    // headings from the workspace, so a link elsewhere pointing at one of them
+    // reported as broken.
+    //
+    // Restoring the encoding guard to that set, rather than reporting it from
+    // here, keeps per-file ignores, inline comments, severity and the report cap
+    // with the pipeline that already implements them.
+    let mut document_set_with_guard;
+    let document_set: &[Box<dyn rumdl_lib::rule::Rule>] = if restore_encoding_guard {
+        document_set_with_guard = rule_sets
+            .document
+            .iter()
+            .map(|rule| dyn_clone::clone_box(&**rule))
+            .collect::<Vec<_>>();
+        document_set_with_guard.push(Box::new(rumdl_lib::encoding::MD094InvalidEncoding));
+        &document_set_with_guard
+    } else {
+        &rule_sets.document
+    };
+
+    let run = rumdl_lib::document_run::DocumentRun::from_scanned(&conflict_scan, document_set, config)
+        .file_path(Path::new(file_path))
+        .verbose(verbose)
+        .invalid_utf8(invalid_utf8.as_deref());
+    let rumdl_lib::document_run::DocumentFormatResult {
+        warnings: warnings_result,
+        file_index,
+        fixes: prepared_fix,
+        remaining_warnings: prepared_remaining_warnings,
+    } = rumdl_lib::time_section!("file: lint and index", {
+        if prepare_fixes && !lossy && ignored_rules_for_file.is_empty() && !is_rust_source(Path::new(file_path)) {
+            run.analyze_and_fix(100)
+        } else {
+            let (warnings, file_index) = run.analyze_raw();
+            rumdl_lib::document_run::DocumentFormatResult {
+                warnings,
+                file_index,
+                fixes: None,
+                remaining_warnings: None,
+            }
+        }
+    });
+
+    // Combine all warnings
+    let mut all_warnings = warnings_result.unwrap_or_default();
+
+    // Warnings from the sources beside the document lint: markdown embedded in a
+    // fenced block, and code blocks handed to external tools. Both go through the
+    // funnel the re-lint uses, so a fix run reconciles like against like.
+    let tool_failed = {
+        // An embedded block is part of this file, so its findings are this file's
+        // and per-file-ignores decides which of them are reported.
+        let filtered_rule_sets =
+            rumdl_lib::time_function!("file: filter rules", rule_sets.for_file(&ignored_rules_for_file));
+        let auxiliary = auxiliary_warnings(
+            content,
+            file_path,
+            &filtered_rule_sets.embedded_markdown,
+            filtered_rule_sets.auxiliary,
+            config,
+        );
+        if !silent && !auxiliary.tool_warnings.is_empty() {
+            let display_path = discovered_display_path(file_path, None);
+            for msg in &auxiliary.tool_warnings {
+                eprintln!("Warning: {}", format_tool_warning(msg, &display_path));
+            }
+        }
+        all_warnings.extend(auxiliary.warnings);
+        auxiliary.tool_failed
+    };
+
+    // Sort warnings by line number, then column
+    rumdl_lib::time_section!("file: sort warnings", {
+        all_warnings.sort_by(|a, b| {
+            if a.line == b.line {
+                a.column.cmp(&b.column)
+            } else {
+                a.line.cmp(&b.line)
+            }
+        });
+    });
+
+    let total_warnings = all_warnings.len();
+
+    // Count fixable issues (using capability-based check)
+    let fixable_warnings = all_warnings
+        .iter()
+        .filter(|w| {
+            w.fix.is_some()
+                && w.rule_name
+                    .as_ref()
+                    .is_some_and(|name| is_rule_cli_fixable_in(&rule_sets.document, &document_rules, config, name))
+        })
+        .count();
+
+    let lint_end_time = Instant::now();
+    let lint_time = lint_end_time.duration_since(lint_start);
+
+    if verbose && !quiet {
+        println!("Linting took: {lint_time:?}");
+    }
+
+    let total_time = start_time.elapsed();
+    if verbose && !quiet {
+        println!("Total processing time for {file_path}: {total_time:?}");
+    }
+
+    // Store in cache before returning (ignore if mutex is poisoned). A result in
+    // which a code-block tool could not run left a block unchecked, so the next
+    // run has to try again rather than replay it.
+    if let Some(ref cache_arc) = cache
+        && !tool_failed
+    {
+        rumdl_lib::time_section!("cache: store total", {
+            let dependency_fingerprint = md057_rule.map(|rule| {
+                rule.cache_dependency_fingerprint(
+                    Path::new(file_path),
+                    config.get_flavor_for_file(Path::new(file_path)),
+                    &file_index,
+                )
+            });
+            cache_arc.set_report_for_path(
+                file_path,
+                &file_hash,
+                &config_hash,
+                &rules_hash,
+                all_warnings.clone(),
+                dependency_fingerprint,
+            );
+        });
+    }
+
+    ProcessFileResult {
+        warnings: all_warnings,
+        content: conflict_scan.into_content().into_owned(),
+        total_warnings,
+        fixable_warnings,
+        line_ending_map,
+        file_index,
+        file_index_reused: false,
+        errored: false,
+        inline_config_warning,
+        lossy,
+        prepared_fix,
+        prepared_remaining_warnings: prepared_remaining_warnings.map(Result::unwrap_or_default),
+        format_stable: false,
+        format_probe_changed: false,
+    }
+}
+
+/// Apply the fixes a file's own markdown produces.
+///
+/// The fix-side counterpart of the lint pass, and it has to read a file the way
+/// that pass read it. A Rust file is markdown only inside its doc comments, so
+/// its source is never handed to the markdown fixer: every edit that produced
+/// would be a byte no `check` of the same file ever reported, and the edits are
+/// not hypothetical (`#[derive(Debug)]` is an MD018 heading, so the fixer writes
+/// `# [derive(Debug)]` and the file stops being Rust). What such a file gets
+/// instead is `format_doc_comment_blocks`, reached through `apply_auxiliary_fixes`
+/// on the file path and called directly on the stdin path.
+///
+/// Returns whether the content was rewritten.
+pub fn apply_document_fixes(
+    rules: &[Box<dyn Rule>],
+    content: &mut String,
+    quiet: bool,
+    silent: bool,
+    config: &rumdl_config::Config,
+    file_path: Option<&std::path::Path>,
+) -> bool {
+    if file_path.is_some_and(is_rust_source) {
+        return false;
+    }
+
+    apply_fixes_coordinated(rules, content, quiet, silent, config, file_path)
+}
+
+/// Apply every rule's fix to a document, iterating until the result is stable.
+///
+/// Reports whether the document changed, and nothing about which warnings that
+/// resolved: the coordinator works rule by rule on whole documents, and one
+/// rule's rewrite routinely resolves another's finding. Which warnings a fix run
+/// resolved is settled afterwards, by re-linting and reconciling (see
+/// `fix_reporting`).
+///
+/// Takes the content it is given as markdown. Callers holding a path go through
+/// `apply_document_fixes`, which decides whether the file is markdown at all.
+pub fn apply_fixes_coordinated(
+    rules: &[Box<dyn Rule>],
+    content: &mut String,
+    _quiet: bool,
+    silent: bool,
+    config: &rumdl_config::Config,
+    file_path: Option<&std::path::Path>,
+) -> bool {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let run = rumdl_lib::document_run::DocumentRun::new(content, rules, config);
+    let run = match file_path {
+        Some(path) => run.file_path(path),
+        None => run,
+    };
+
+    // Apply fixes iteratively (up to 100 iterations to ensure convergence, same as Ruff).
+    let result = run.fix_for_formatter(100);
+    finish_fix_run(result, content, silent, file_path, Some(start.elapsed()))
+}
+
+/// Fix extracted Markdown without treating its first character as an encoding marker.
+pub fn apply_fixes_to_fragment(rules: &[Box<dyn Rule>], fragment: &mut String, config: &rumdl_config::Config) -> bool {
+    let normalized = rumdl_lib::utils::normalize_line_ending(fragment, rumdl_lib::utils::LineEnding::Lf);
+    let mut fixed = normalized.to_string();
+    let result =
+        rumdl_lib::fix_coordinator::FixCoordinator::new().apply_fixes_to_fragment(rules, &mut fixed, config, 100);
+    let fixed = rumdl_lib::utils::NormalizedLineEndingMap::new(fragment)
+        .restore_fixed(&normalized, &fixed)
+        .into_owned();
+    finish_fix_run(Ok((fixed, result)), fragment, true, None, None)
+}
+
+fn finish_fix_run(
+    result: Result<(String, rumdl_lib::fix_coordinator::FixResult), String>,
+    content: &mut String,
+    silent: bool,
+    file_path: Option<&Path>,
+    elapsed: Option<std::time::Duration>,
+) -> bool {
+    match result {
+        Ok((fixed_content, result)) => {
+            *content = fixed_content;
+
+            if std::env::var("RUMDL_DEBUG_FIX_PERF").is_ok() {
+                eprintln!("DEBUG: Fix Coordinator used");
+                eprintln!("DEBUG: Iterations: {}", result.iterations);
+                eprintln!("DEBUG: Rules applied: {}", result.rules_fixed);
+                eprintln!("DEBUG: LintContext creations: {}", result.context_creations);
+                eprintln!("DEBUG: Converged: {}", result.converged);
+                if let Some(elapsed) = elapsed {
+                    eprintln!("DEBUG: Total time: {elapsed:?}");
+                }
+            }
+
+            // Warn if convergence failed (Ruff-style)
+            if !result.converged && !silent {
+                for line in build_non_convergence_warning_lines(&result, file_path) {
+                    eprintln!("{line}");
+                }
+            }
+
+            !result.fixed_rule_names.is_empty()
+        }
+        Err(e) => {
+            if !silent {
+                eprintln!("Warning: Fix coordinator failed: {e}");
+            }
+            false
+        }
+    }
+}
+
+/// Format an error_messages string (from OnError::Warn path) for user display.
+///
+/// Input format: `"line 15 (shell): Tool 'shfmt' failed: Exit code 1: <standard input>:3:27: msg"`
+/// Output format: `"docs/guide.md:18:27: [shfmt] msg"`
+fn format_tool_warning(msg: &str, display_path: &str) -> String {
+    // Parse "line N (lang): rest" prefix
+    let Some(rest) = msg.strip_prefix("line ") else {
+        return format!("{display_path}: {msg}");
+    };
+    let Some(space_pos) = rest.find(' ') else {
+        return format!("{display_path}: {msg}");
+    };
+    let Ok(fence_line) = rest[..space_pos].parse::<usize>() else {
+        return format!("{display_path}: {msg}");
+    };
+    // Extract "(lang): rest_of_message"
+    let after_line = &rest[space_pos + 1..];
+    let Some(paren_end) = after_line.find("): ") else {
+        return format!("{display_path}: {msg}");
+    };
+    let error_msg = &after_line[paren_end + 3..];
+
+    // Extract tool name from "Tool 'name' failed: ..." and strip boilerplate
+    let (tool_bracket, clean_error) = if let Some(tool_start) = error_msg.find("Tool '") {
+        let name_start = tool_start + 6;
+        if let Some(name_end) = error_msg[name_start..].find("' failed: ") {
+            let tool = &error_msg[name_start..name_start + name_end];
+            let after_failed = &error_msg[name_start + name_end + 10..];
+            let stripped = strip_exit_code_prefix(after_failed);
+            (format!("[{tool}]"), stripped.to_string())
+        } else {
+            (String::new(), error_msg.to_string())
+        }
+    } else {
+        (String::new(), error_msg.to_string())
+    };
+
+    let (location, cleaned) = extract_stdin_location(&clean_error, fence_line);
+    let loc = location.unwrap_or_else(|| format!("{fence_line}"));
+    if tool_bracket.is_empty() {
+        format!("{display_path}:{loc}: {cleaned}")
+    } else {
+        format!("{display_path}:{loc}: {tool_bracket} {cleaned}")
+    }
+}
+
+/// Format a code-block-tools ProcessorError for user display.
+///
+/// For `ToolErrorAt` errors, produces `file:line:col: [tool] message` format matching
+/// rumdl's own lint output style. Translates `<standard input>:N:` references to
+/// absolute file line numbers and strips boilerplate like exit codes.
+fn format_tool_error(err: &ProcessorError, display_path: &str) -> String {
+    match err {
+        ProcessorError::ToolErrorAt {
+            error,
+            line: fence_line,
+            ..
+        } => match error {
+            ExecutorError::ExecutionFailed { tool, message } => {
+                let stripped = strip_exit_code_prefix(message);
+                let (location, cleaned) = extract_stdin_location(stripped, *fence_line);
+                let loc = location.unwrap_or_else(|| format!("{fence_line}"));
+                format!("{display_path}:{loc}: [{tool}] {cleaned}")
+            }
+            ExecutorError::Timeout { tool, timeout_ms } => {
+                format!("{display_path}:{fence_line}: [{tool}] timed out after {timeout_ms}ms")
+            }
+            ExecutorError::RepeatedTimeouts {
+                tool,
+                timeout_ms,
+                timeouts,
+            } => {
+                format!(
+                    "{display_path}:{fence_line}: [{tool}] skipped after timing out {timeouts} times at {timeout_ms}ms; the tool is likely not reading stdin"
+                )
+            }
+            ExecutorError::ToolNotFound { tool } => {
+                format!("{display_path}:{fence_line}: [{tool}] not found in PATH")
+            }
+            ExecutorError::IoError { message } => {
+                format!("{display_path}:{fence_line}: I/O error: {message}")
+            }
+        },
+        _ => format!("{display_path}: {err}"),
+    }
+}
+
+/// Strip "Exit code N: " prefix from tool error messages.
+fn strip_exit_code_prefix(message: &str) -> &str {
+    if let Some(rest) = message.strip_prefix("Exit code ")
+        && let Some(colon_pos) = rest.find(": ")
+    {
+        return &rest[colon_pos + 2..];
+    }
+    message
+}
+
+/// Extract `<standard input>:N:M:` from a tool error message, returning the absolute
+/// `line:col` string and the cleaned-up message with the stdin reference removed.
+///
+/// Returns `(Some("18:27"), "Tool 'shfmt' failed: Exit code 1: `>` must be...")` on
+/// success, or `(None, original_message)` if no stdin reference is found.
+fn extract_stdin_location(message: &str, fence_line: usize) -> (Option<String>, String) {
+    const STDIN_PREFIX: &str = "<standard input>:";
+    let Some(pos) = message.find(STDIN_PREFIX) else {
+        return (None, message.to_string());
+    };
+    let after = &message[pos + STDIN_PREFIX.len()..];
+    // Parse line number
+    let Some(first_colon) = after.find(':') else {
+        return (None, message.to_string());
+    };
+    let Ok(tool_line) = after[..first_colon].parse::<usize>() else {
+        return (None, message.to_string());
+    };
+    let absolute_line = fence_line + tool_line;
+
+    // Try to parse column number
+    let rest_after_line = &after[first_colon + 1..];
+    let (location, remaining_start) = if let Some(second_colon) = rest_after_line.find(':')
+        && let Ok(col) = rest_after_line[..second_colon].parse::<usize>()
+    {
+        // Have both line and column
+        let skip = pos + STDIN_PREFIX.len() + first_colon + 1 + second_colon + 1;
+        (format!("{absolute_line}:{col}"), skip)
+    } else {
+        // Only line number
+        let skip = pos + STDIN_PREFIX.len() + first_colon + 1;
+        (format!("{absolute_line}"), skip)
+    };
+
+    // Reconstruct message: everything before the stdin ref + everything after line:col:
+    let before = message[..pos].trim_end();
+    let after_ref = message[remaining_start..].trim_start();
+    let cleaned = if before.is_empty() {
+        after_ref.to_string()
+    } else if after_ref.is_empty() {
+        before.to_string()
+    } else {
+        format!("{before} {after_ref}")
+    };
+    (Some(location), cleaned)
+}
+
+fn format_loop(cycle: &[String]) -> Option<String> {
+    if cycle.is_empty() {
+        return None;
+    }
+
+    let mut parts = cycle.to_vec();
+    if let Some(first) = parts.first().cloned() {
+        parts.push(first);
+    }
+    Some(parts.join(" -> "))
+}
+
+fn build_non_convergence_warning_lines(
+    result: &rumdl_lib::fix_coordinator::FixResult,
+    file_path: Option<&Path>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let location = file_path.map(|p| format!(" for {}", p.display())).unwrap_or_default();
+
+    if !result.conflicting_rules.is_empty() {
+        let mut rules = result.conflicting_rules.clone();
+        rules.sort();
+        let rule_list = rules.join(", ");
+        let primary_rule = rules[0].clone();
+
+        lines.push(format!(
+            "Warning: Auto-fix detected a rule conflict loop after {} iterations{}.",
+            result.iterations, location
+        ));
+        lines.push(format!("Conflicting rules: {rule_list}"));
+        if let Some(loop_str) = format_loop(&result.conflict_cycle) {
+            lines.push(format!("Observed cycle: {loop_str}"));
+        }
+        lines.push("Actionable options:".to_string());
+        lines.push(format!(
+            "  - Keep linting but stop auto-fixing one rule: [global] unfixable = [\"{primary_rule}\"]"
+        ));
+        lines.push(format!(
+            "  - Disable one rule entirely for this run: rumdl check --fix --disable {primary_rule}"
+        ));
+        lines.push(format!(
+            "  - Disable one rule in config: [global] disable = [\"{primary_rule}\"]"
+        ));
+        lines.push(
+            "If this looks wrong, please report it: https://github.com/rvben/rumdl/issues/new?template=bug_report.yml"
+                .to_string(),
+        );
+        return lines;
+    }
+
+    let mut fixed_rules: Vec<String> = result.fixed_rule_names.iter().cloned().collect();
+    fixed_rules.sort();
+    let fixed_rules_list = if fixed_rules.is_empty() {
+        "(none)".to_string()
+    } else {
+        fixed_rules.join(", ")
+    };
+
+    lines.push(format!(
+        "Warning: Auto-fix did not converge after {} iterations{}.",
+        result.iterations, location
+    ));
+    lines.push("No repeatable cycle was detected; this is likely a convergence bug.".to_string());
+    lines.push(format!("Rules that changed content: {fixed_rules_list}"));
+    if !fixed_rules.is_empty() {
+        let quoted_rules = fixed_rules
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "Try narrowing auto-fix scope: [global] fixable = [{quoted_rules}]"
+        ));
+    }
+    lines.push("Please report it: https://github.com/rvben/rumdl/issues/new?template=bug_report.yml".to_string());
+    lines
+}
+
+/// Process a Rust source file by linting markdown in doc comments.
+///
+/// Returns a `ProcessFileResult` with warnings remapped to their original file
+/// positions. No cross-file analysis is performed for doc comments.
+fn process_rust_file_doc_comments(
+    file_path: &str,
+    content: &str,
+    rules: &[Box<dyn Rule>],
+    config: &rumdl_config::Config,
+    line_ending_map: rumdl_lib::utils::NormalizedLineEndingMap,
+) -> ProcessFileResult {
+    // Filter rules based on per-file-ignores configuration
+    let ignored_rules_for_file = config.get_ignored_rules_for_file(Path::new(file_path));
+    let filtered_rules: Vec<Box<dyn Rule>> = if !ignored_rules_for_file.is_empty() {
+        rules
+            .iter()
+            .filter(|rule| !ignored_rules_for_file.contains(rule.name()))
+            .map(|r| dyn_clone::clone_box(&**r))
+            .collect()
+    } else {
+        rules.to_vec()
+    };
+
+    let all_warnings = rumdl_lib::doc_comment_lint::check_doc_comment_blocks(content, &filtered_rules, config);
+
+    let total_warnings = all_warnings.len();
+    // Doc comment warnings have fix stripped (fix: None) in check mode, so
+    // determine fixability by checking the rule's fix capability instead.
+    let fixable_warnings = all_warnings
+        .iter()
+        .filter(|w| {
+            w.rule_name
+                .as_ref()
+                .is_some_and(|name| is_rule_cli_fixable(rules, config, name))
+        })
+        .count();
+
+    ProcessFileResult {
+        warnings: all_warnings,
+        content: content.to_string(),
+        total_warnings,
+        fixable_warnings,
+        line_ending_map,
+        file_index: rumdl_lib::workspace_index::FileIndex::new(),
+        file_index_reused: false,
+        errored: false,
+        // Rust doc-comment linting does not process markdown inline disable
+        // comments (the rust path returns before that detection runs).
+        inline_config_warning: false,
+        lossy: false,
+        prepared_fix: None,
+        prepared_remaining_warnings: None,
+        format_stable: false,
+        format_probe_changed: false,
+    }
+}
+
+#[cfg(test)]
+mod format_check_probe_tests {
+    use super::*;
+
+    fn default_rules(config: &rumdl_config::Config) -> RuleSets {
+        let opt_in = rumdl_lib::rules::opt_in_rules();
+        let rules: Vec<_> = rumdl_lib::rules::all_rules(config)
+            .into_iter()
+            .filter(|rule| !opt_in.contains(rule.name()))
+            .collect();
+        RuleSets {
+            mode: crate::CodeBlockToolsMode::Configured,
+            selected: std::sync::Arc::new(rules.iter().map(|rule| dyn_clone::clone_box(&**rule)).collect()),
+            embedded_markdown: rules.iter().map(|rule| dyn_clone::clone_box(&**rule)).collect(),
+            document: rules,
+            auxiliary: AuxiliaryExecutionPlan {
+                lint: true,
+                format: true,
+                relint: true,
+            },
+        }
+    }
+
+    fn process(path: &Path, check_only: bool, diff: bool, config: &rumdl_config::Config) -> FileProcessResult {
+        process_file_with_formatter(
+            &path.to_string_lossy(),
+            &default_rules(config),
+            crate::FixMode::Format,
+            diff,
+            false,
+            true,
+            true,
+            &rumdl_lib::output::OutputFormat::Text,
+            &rumdl_lib::output::OutputWriter::new(false, true),
+            config,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            true,
+            check_only,
+        )
+    }
+
+    #[test]
+    fn first_change_check_matches_complete_cli_status_and_preserves_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("test.md");
+        let config = rumdl_config::Config::default();
+        let mut cases = vec![
+            "",
+            "# Title\n\nClean body.\n",
+            "#Title\nText  body with https://example.com and _word_ with *one* and *two*. \n\n\nEnd",
+            "# Title\n\n![ ](image.png)\n",
+            "<!-- rumdl-disable -->\n#Title\nText  body. \n",
+            "<!-- rumdl-disable MD064 -->\n# Title\n\nText  body.\n",
+            "<!-- rumdl-disable MD999 -->\n#Title\n",
+            "<<<<<<< HEAD\n#Title\n=======\n##Other\n>>>>>>> branch\n",
+            "# Title\r\n\r\nText  body. \r\n",
+            "---\n---\n#  heading!  ##\ntext with a fairly long sentence that should wrap at the configured line width.\n",
+            "# Title\n\n| A | B |\n| --- | --- |\n| https://example.com | _word_ with *one* and *two* |\n",
+            "# Title\n\n```markdown\n#Inner\ntext\n```\n",
+        ]
+        .into_iter()
+        .map(|source| source.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+        cases.push(b"# Title\n\nInvalid \xff byte.\n".to_vec());
+        for bytes in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            let native = process(&path, false, true, &config);
+            let candidate = process(&path, true, true, &config);
+            assert_eq!(candidate.content_changed, native.content_changed, "{bytes:?}");
+            assert_eq!(candidate.errored, native.errored, "{bytes:?}");
+            assert_eq!(candidate.config_warning, native.config_warning, "{bytes:?}");
+            assert_eq!(candidate.has_issues, native.has_issues, "{bytes:?}");
+            assert_eq!(candidate.warnings, native.warnings, "{bytes:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn first_change_probe_never_exposes_partial_formatted_text() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("test.md");
+        let source = "#Title\nText  body. \n\n\nEnd";
+        std::fs::write(&path, source).unwrap();
+        let config = rumdl_config::Config::default();
+        let result = process_file_with_index(
+            &path.to_string_lossy(),
+            &default_rules(&config),
+            false,
+            true,
+            true,
+            &config,
+            None,
+            None,
+            None,
+            true,
+            true,
+            true,
+        );
+        assert!(result.format_probe_changed);
+        assert!(result.prepared_fix.is_none());
+        assert!(!result.format_stable);
+        assert_eq!(result.content, source);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[test]
+    fn actual_writes_always_complete_the_formatter() {
+        let folder = tempfile::tempdir().unwrap();
+        let native = folder.path().join("native.md");
+        let candidate = folder.path().join("candidate.md");
+        let source = "#Title\nText  body with https://example.com. \n\n\nEnd";
+        std::fs::write(&native, source).unwrap();
+        std::fs::write(&candidate, source).unwrap();
+        let config = rumdl_config::Config::default();
+        let expected = process(&native, false, false, &config);
+        let actual = process(&candidate, true, false, &config);
+        assert!(expected.content_changed && actual.content_changed);
+        assert!(!expected.errored && !actual.errored);
+        assert_eq!(std::fs::read(native).unwrap(), std::fs::read(candidate).unwrap());
+    }
+}
+
+fn plan_document_fixes(
+    rules: &[Box<dyn Rule>],
+    content: &mut String,
+    config: &rumdl_config::Config,
+    path: &Path,
+) -> Result<bool, String> {
+    if is_rust_source(path) {
+        return Ok(false);
+    }
+    let run = rumdl_lib::document_run::DocumentRun::new(content, rules, config).file_path(path);
+    let outcome = run.fix_for_formatter(100);
+    let (fixed, result) = outcome.map_err(|e| format!("Cannot plan document fixes: {e}"))?;
+    if !result.converged {
+        return Err("Document fixes did not converge; planned output was discarded".into());
+    }
+    let changed = fixed != *content;
+    *content = fixed;
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rumdl_lib::fix_coordinator::FixResult;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_build_non_convergence_warning_lines_conflict_loop() {
+        let result = FixResult {
+            rules_fixed: 3,
+            iterations: 6,
+            context_creations: 6,
+            fixed_rule_names: ["MD044".to_string(), "MD063".to_string()].into_iter().collect(),
+            converged: false,
+            conflicting_rules: vec!["MD063".to_string(), "MD044".to_string()],
+            conflict_cycle: vec!["MD044".to_string(), "MD063".to_string()],
+        };
+
+        let lines = build_non_convergence_warning_lines(&result, Some(Path::new("docs/guide.md")));
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("rule conflict loop"));
+        assert!(rendered.contains("for docs/guide.md"));
+        assert!(rendered.contains("Conflicting rules: MD044, MD063"));
+        assert!(rendered.contains("Observed cycle: MD044 -> MD063 -> MD044"));
+        assert!(rendered.contains("[global] unfixable = [\"MD044\"]"));
+        assert!(rendered.contains("rumdl check --fix --disable MD044"));
+    }
+
+    #[test]
+    fn test_build_non_convergence_warning_lines_max_iterations() {
+        let result = FixResult {
+            rules_fixed: 10,
+            iterations: 100,
+            context_creations: 100,
+            fixed_rule_names: ["MD009".to_string(), "MD012".to_string()].into_iter().collect(),
+            converged: false,
+            conflicting_rules: Vec::new(),
+            conflict_cycle: Vec::new(),
+        };
+
+        let lines = build_non_convergence_warning_lines(&result, None);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("did not converge after 100 iterations"));
+        assert!(rendered.contains("Rules that changed content: MD009, MD012"));
+        assert!(rendered.contains("[global] fixable = [\"MD009\", \"MD012\"]"));
+        assert!(rendered.contains("Please report it"));
+    }
+
+    #[test]
+    fn test_format_loop_renders_closed_cycle() {
+        let cycle = vec!["MD044".to_string(), "MD063".to_string()];
+        assert_eq!(format_loop(&cycle).as_deref(), Some("MD044 -> MD063 -> MD044"));
+    }
+
+    #[test]
+    fn test_format_loop_empty() {
+        assert!(format_loop(&[]).is_none());
+    }
+
+    #[test]
+    fn test_build_non_convergence_warning_lines_handles_empty_rule_set() {
+        let result = FixResult {
+            rules_fixed: 0,
+            iterations: 100,
+            context_creations: 100,
+            fixed_rule_names: HashSet::new(),
+            converged: false,
+            conflicting_rules: Vec::new(),
+            conflict_cycle: Vec::new(),
+        };
+
+        let lines = build_non_convergence_warning_lines(&result, Some(Path::new("README.md")));
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("for README.md"));
+        assert!(rendered.contains("Rules that changed content: (none)"));
+    }
+
+    #[test]
+    fn extract_stdin_location_with_line_and_col() {
+        let msg = "<standard input>:3:27: `>` must be followed by a word";
+        let (loc, cleaned) = super::extract_stdin_location(msg, 15);
+        assert_eq!(loc.as_deref(), Some("18:27"));
+        assert_eq!(cleaned, "`>` must be followed by a word");
+    }
+
+    #[test]
+    fn extract_stdin_location_line_only() {
+        let msg = "<standard input>:5: syntax error";
+        let (loc, cleaned) = super::extract_stdin_location(msg, 10);
+        assert_eq!(loc.as_deref(), Some("15"));
+        assert_eq!(cleaned, "syntax error");
+    }
+
+    #[test]
+    fn extract_stdin_location_no_stdin_ref() {
+        let msg = "Unknown option --foo";
+        let (loc, cleaned) = super::extract_stdin_location(msg, 10);
+        assert!(loc.is_none());
+        assert_eq!(cleaned, msg);
+    }
+
+    #[test]
+    fn extract_stdin_location_mid_string() {
+        let msg = "some prefix <standard input>:3:27: error text";
+        let (loc, cleaned) = super::extract_stdin_location(msg, 15);
+        assert_eq!(loc.as_deref(), Some("18:27"));
+        assert_eq!(cleaned, "some prefix error text");
+    }
+
+    #[test]
+    fn strip_exit_code_prefix_present() {
+        assert_eq!(super::strip_exit_code_prefix("Exit code 1: some error"), "some error");
+        assert_eq!(super::strip_exit_code_prefix("Exit code 127: not found"), "not found");
+    }
+
+    #[test]
+    fn strip_exit_code_prefix_absent() {
+        assert_eq!(
+            super::strip_exit_code_prefix("some error without prefix"),
+            "some error without prefix"
+        );
+    }
+
+    #[test]
+    fn format_tool_error_execution_failed_with_stdin() {
+        use rumdl_lib::code_block_tools::executor::ExecutorError;
+        use rumdl_lib::code_block_tools::processor::ProcessorError;
+        let err = ProcessorError::ToolErrorAt {
+            error: ExecutorError::ExecutionFailed {
+                tool: "shfmt".to_string(),
+                message: "Exit code 1: <standard input>:3:27: `>` must be followed by a word".to_string(),
+            },
+            line: 15,
+            language: "shell".to_string(),
+        };
+        assert_eq!(
+            super::format_tool_error(&err, "docs/guide.md"),
+            "docs/guide.md:18:27: [shfmt] `>` must be followed by a word"
+        );
+    }
+
+    #[test]
+    fn format_tool_error_execution_failed_without_stdin() {
+        use rumdl_lib::code_block_tools::executor::ExecutorError;
+        use rumdl_lib::code_block_tools::processor::ProcessorError;
+        let err = ProcessorError::ToolErrorAt {
+            error: ExecutorError::ExecutionFailed {
+                tool: "black".to_string(),
+                message: "Exit code 1: cannot format".to_string(),
+            },
+            line: 15,
+            language: "python".to_string(),
+        };
+        assert_eq!(
+            super::format_tool_error(&err, "readme.md"),
+            "readme.md:15: [black] cannot format"
+        );
+    }
+
+    #[test]
+    fn format_tool_error_timeout() {
+        use rumdl_lib::code_block_tools::executor::ExecutorError;
+        use rumdl_lib::code_block_tools::processor::ProcessorError;
+        let err = ProcessorError::ToolErrorAt {
+            error: ExecutorError::Timeout {
+                tool: "prettier".to_string(),
+                timeout_ms: 5000,
+            },
+            line: 20,
+            language: "javascript".to_string(),
+        };
+        assert_eq!(
+            super::format_tool_error(&err, "test.md"),
+            "test.md:20: [prettier] timed out after 5000ms"
+        );
+    }
+
+    #[test]
+    fn format_tool_warning_with_stdin_ref() {
+        let msg = "line 15 (shell): Tool 'shfmt' failed: Exit code 1: <standard input>:3:27: bad syntax";
+        let result = super::format_tool_warning(msg, "docs/guide.md");
+        assert_eq!(result, "docs/guide.md:18:27: [shfmt] bad syntax");
+    }
+
+    #[test]
+    fn format_tool_warning_without_stdin_ref() {
+        let msg = "line 15 (python): Tool 'black' failed: Exit code 1: cannot format";
+        let result = super::format_tool_warning(msg, "readme.md");
+        assert_eq!(result, "readme.md:15: [black] cannot format");
+    }
+
+    #[test]
+    fn format_tool_warning_no_prefix() {
+        let msg = "No format tools configured for language 'ruby' at line 5";
+        let result = super::format_tool_warning(msg, "test.md");
+        assert_eq!(
+            result,
+            "test.md: No format tools configured for language 'ruby' at line 5"
+        );
+    }
+}

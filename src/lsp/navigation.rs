@@ -1,0 +1,2464 @@
+//! Go-to-definition, find-references, and rename for markdown links
+//!
+//! Provides navigation features for the LSP server:
+//!
+//! - **Go to definition** -- jump from a `[text](file.md#heading)` link to the
+//!   target file and heading.
+//!
+//! - **Find references** -- from a heading, find all links pointing to it across
+//!   the workspace.
+//!
+//! - **Rename** -- rename a heading and update all links that reference it.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use tower_lsp::lsp_types::*;
+
+use super::position::{byte_to_utf16_offset, char_column_to_utf16, utf16_to_byte_offset};
+use super::server::RumdlLanguageServer;
+use crate::config::MarkdownFlavor;
+use crate::utils::anchor_styles::AnchorStyle;
+use crate::workspace_index::{
+    CrossFileLinkIndex, HeadingIndex, PROTOCOL_DOMAIN_REGEX, link_target_file, normalize_relative_path,
+};
+
+/// Full link target extracted from a markdown link `[text](file_path#anchor)`.
+///
+/// Unlike `LinkTargetInfo` (used for completion, which returns content up to the
+/// cursor), this struct contains the complete file path and anchor regardless of
+/// where the cursor sits within the link target.
+struct FullLinkTarget {
+    /// The file path portion (before `#`), may be empty for same-file anchors
+    file_path: String,
+    /// The anchor/fragment portion (after `#`), empty when absent
+    anchor: String,
+}
+
+impl FullLinkTarget {
+    fn from_destination(destination: &str) -> Self {
+        destination.find('#').map_or_else(
+            || Self {
+                file_path: destination.to_string(),
+                anchor: String::new(),
+            },
+            |hash| Self {
+                file_path: destination[..hash].to_string(),
+                anchor: destination[hash + 1..].to_string(),
+            },
+        )
+    }
+}
+
+/// Strip a CommonMark link title from a link target.
+///
+/// Link titles start after whitespace followed by `"`, `'`, or `(`.
+/// E.g., `guide.md "My Title"` -> `guide.md`
+fn strip_link_title(target: &str) -> &str {
+    for (i, _) in target.match_indices(' ') {
+        let after = &target[i + 1..];
+        if after.starts_with('"') || after.starts_with('\'') || after.starts_with('(') {
+            return target[..i].trim_end();
+        }
+    }
+    target
+}
+
+/// Check whether a link target is an external URL (has a protocol or `www.` prefix).
+///
+/// External URLs like `https://example.com` or `mailto:user@host` have no
+/// corresponding local file, so go-to-definition and find-references should
+/// return `None` for them.
+fn is_external_url(target: &str) -> bool {
+    PROTOCOL_DOMAIN_REGEX.is_match(target)
+}
+
+/// Whether a root-relative link resolves to `target` under any content root.
+///
+/// `link_target` is the link path with its leading `/` already stripped (as
+/// stored in `FileIndex::root_relative_links`), so it can be joined directly to
+/// each content root.
+fn root_relative_link_resolves(content_roots: &[PathBuf], link_target: &str, target: &Path) -> bool {
+    content_roots
+        .iter()
+        .any(|root| normalize_relative_path(&root.join(link_target)) == *target)
+}
+
+/// Find the position of the closing `)` that balances with the opening `(`.
+///
+/// CommonMark allows balanced parentheses in link destinations, e.g.
+/// `[text](file(1).md)`. This helper tracks nesting depth to find the
+/// correct closing paren.
+fn find_balanced_close_paren(s: &str) -> Option<usize> {
+    let mut depth: usize = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Detect the full link target when the cursor is anywhere inside `](...)`.
+///
+/// Scans backward from the cursor to find `](` and forward to find the closing
+/// `)`, then extracts the complete file path and optional anchor.
+fn detect_full_link_target(text: &str, position: Position) -> Option<FullLinkTarget> {
+    let line_num = position.line as usize;
+    let utf16_cursor = position.character as usize;
+
+    let lines: Vec<&str> = text.lines().collect();
+    if line_num >= lines.len() {
+        return None;
+    }
+    let line = lines[line_num];
+
+    // Convert UTF-16 cursor to byte offset
+    let byte_cursor = utf16_to_byte_offset(line, utf16_cursor)?;
+
+    let before_cursor = &line[..byte_cursor];
+
+    // Find the last `](` before the cursor
+    let link_open = before_cursor.rfind("](")?;
+    let content_start = link_open + 2;
+
+    // Find the balanced closing `)` after the content start
+    let after_open = &line[content_start..];
+    let close_paren = find_balanced_close_paren(after_open)?;
+
+    let raw_content = &after_open[..close_paren];
+
+    // Verify the cursor is within the link target (between `](` and `)`)
+    let content_end = content_start + close_paren;
+    if byte_cursor < content_start || byte_cursor > content_end {
+        return None;
+    }
+
+    // Heuristic: odd number of backticks before `](` suggests code span
+    let backtick_count = before_cursor[..link_open].chars().filter(|&c| c == '`').count();
+    if backtick_count % 2 != 0 {
+        return None;
+    }
+
+    // Strip angle brackets: [text](<path.md>) -> path.md
+    let content = raw_content.trim();
+    let content = if content.starts_with('<') && content.ends_with('>') {
+        &content[1..content.len() - 1]
+    } else {
+        content
+    };
+
+    // Strip link title: guide.md "Title" -> guide.md
+    let content = strip_link_title(content);
+
+    // Split on first `#` to separate file path from anchor
+    if let Some(hash_pos) = content.find('#') {
+        Some(FullLinkTarget {
+            file_path: content[..hash_pos].to_string(),
+            anchor: content[hash_pos + 1..].to_string(),
+        })
+    } else {
+        Some(FullLinkTarget {
+            file_path: content.to_string(),
+            anchor: String::new(),
+        })
+    }
+}
+
+/// The location of an indexed link in `source_lines`, the lines of the file
+/// that holds it. The index counts 1-indexed lines and characters, as
+/// `LintWarning` does; LSP counts 0-indexed lines and UTF-16 code units.
+fn reference_location(source_uri: &Url, source_lines: &[&str], link: &CrossFileLinkIndex) -> Location {
+    let line = link.line.saturating_sub(1);
+    // These locations are read from disk. An encoding marker is not a column
+    // of the editor buffer opened for this location. Later lines stay unchanged.
+    let text_line = source_lines.get(line).copied().map(|text| {
+        if line == 0 {
+            crate::utils::bom::strip_bom(text)
+        } else {
+            text
+        }
+    });
+    let character = char_column_to_utf16(text_line, link.column);
+    let position = Position {
+        line: line as u32,
+        character,
+    };
+    Location {
+        uri: source_uri.clone(),
+        range: Range {
+            start: position,
+            end: position,
+        },
+    }
+}
+
+/// Find same-file fragment-only links (e.g., `[text](#anchor)`) in the given content.
+///
+/// Uses pulldown-cmark to parse the document, which natively skips code blocks
+/// and code spans, eliminating false positives from literal `](#...)` text.
+fn find_same_file_fragment_links(carrier: &str, uri: &Url, anchor: &str) -> Vec<Location> {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    // Parsed after the byte order mark; the editor's first line starts with it.
+    let content = crate::utils::bom::strip_bom(carrier);
+    let mark_units = crate::utils::bom::utf16_len(carrier);
+
+    let options = crate::utils::parser_options::rumdl_parser_options_for(content);
+
+    let parser = Parser::new_ext(content, options).into_offset_iter();
+
+    let mut locations = Vec::new();
+
+    for (event, range) in parser {
+        if let Event::Start(Tag::Link { dest_url, .. }) = event {
+            // Fragment-only: destination is exactly `#something`.
+            // This catches all link types (inline, reference, collapsed, shortcut)
+            // since pulldown-cmark resolves reference destinations for us.
+            if let Some(frag) = dest_url.strip_prefix('#')
+                && frag.eq_ignore_ascii_case(anchor)
+            {
+                // Convert byte offset to line/column (UTF-16 for LSP)
+                let byte_start = range.start;
+                let line_idx = content[..byte_start].matches('\n').count();
+                let line_start = content[..byte_start].rfind('\n').map_or(0, |p| p + 1);
+                let line_text = content[line_start..].split('\n').next().unwrap_or("");
+                let character = byte_to_utf16_offset(line_text, byte_start - line_start)
+                    + if line_idx == 0 { mark_units } else { 0 };
+
+                locations.push(Location {
+                    uri: uri.clone(),
+                    range: Range {
+                        start: Position {
+                            line: line_idx as u32,
+                            character,
+                        },
+                        end: Position {
+                            line: line_idx as u32,
+                            character,
+                        },
+                    },
+                });
+            }
+        }
+    }
+    locations
+}
+
+/// Detect a reference-style link at the cursor and resolve it to a `FullLinkTarget`.
+///
+/// Handles three CommonMark reference link forms:
+/// - Full reference: `[text][ref-id]`
+/// - Collapsed reference: `[text][]`
+/// - Shortcut reference: `[text]`
+///
+/// Also handles cursor on a reference definition line: `[ref-id]: target.md`
+///
+/// Returns `None` if the cursor is not on a reference link or the reference
+/// definition cannot be found in the document.
+fn detect_ref_link_target(text: &str, position: Position, flavor: MarkdownFlavor) -> Option<FullLinkTarget> {
+    let line_num = position.line as usize;
+    let utf16_cursor = position.character as usize;
+
+    let lines: Vec<&str> = text.lines().collect();
+    if line_num >= lines.len() {
+        return None;
+    }
+    let line = lines[line_num];
+    let byte_cursor = utf16_to_byte_offset(line, utf16_cursor)?;
+
+    // First, check if cursor is on a reference definition line: `[ref-id]: target`
+    // Only the document's first line can hold the byte order mark.
+    let definition_line = if line_num == 0 {
+        crate::utils::bom::strip_bom(line)
+    } else {
+        line
+    };
+    if let Some(target) = detect_ref_definition(definition_line, flavor) {
+        return Some(target);
+    }
+
+    // Detect reference link usage and resolve it
+    let ref_id = detect_ref_link_usage(line, byte_cursor)?;
+    resolve_reference_to_target(text, &ref_id, flavor)
+}
+
+/// Detect whether the cursor is on a reference link usage and return the ref ID.
+///
+/// Recognises:
+/// - `[text][ref-id]` — full reference (returns `ref-id`)
+/// - `[text][]`       — collapsed reference (returns `text`)
+/// - `[text]`         — shortcut reference (returns `text`, only when no `(` follows)
+fn detect_ref_link_usage(line: &str, byte_cursor: usize) -> Option<String> {
+    // Heuristic: odd number of backticks before cursor suggests code span
+    let backtick_count = line[..byte_cursor].chars().filter(|&c| c == '`').count();
+    if backtick_count % 2 != 0 {
+        return None;
+    }
+
+    // Skip reference definitions (lines like `[ref]: target`)
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('[')
+        && let Some(colon_pos) = trimmed.find("]:")
+        && colon_pos == trimmed.find(']').unwrap_or(0)
+    {
+        return None;
+    }
+
+    let before = &line[..byte_cursor];
+
+    // Find the nearest `[` before cursor
+    let open = before.rfind('[')?;
+
+    // Find its matching `]`
+    let from_open = &line[open..];
+    let rel_close = from_open.find(']')?;
+    let close = open + rel_close;
+
+    // Cursor must be within this bracket pair
+    if byte_cursor > close {
+        return None;
+    }
+
+    let bracket_content = &line[open + 1..close];
+
+    // Check if this bracket pair is the second part of `[text][ref-id]`
+    // i.e. a `]` immediately precedes our `[`
+    if open > 0 && line.as_bytes()[open - 1] == b']' {
+        if bracket_content.is_empty() {
+            // Collapsed: `[text][]` — ref ID is the text from the first bracket
+            let text_open = line[..open - 1].rfind('[')?;
+            let text_content = &line[text_open + 1..open - 1];
+            return Some(text_content.to_lowercase());
+        }
+        // Full reference: `[text][ref-id]` — cursor is in [ref-id]
+        return Some(bracket_content.to_lowercase());
+    }
+
+    // Cursor is in the first (or only) bracket pair
+    let after_close = &line[close + 1..];
+
+    // Full reference `[text][ref-id]`: cursor is on [text], extract ref-id
+    if after_close.starts_with('[')
+        && let Some(ref_close) = after_close[1..].find(']')
+    {
+        let ref_id = &after_close[1..=ref_close];
+        if !ref_id.is_empty() {
+            return Some(ref_id.to_lowercase());
+        }
+    }
+
+    // Collapsed reference `[text][]`: cursor is on [text]
+    if after_close.starts_with("[]") {
+        return Some(bracket_content.to_lowercase());
+    }
+
+    // Shortcut reference `[text]`: no `(` or `[` follows
+    if !after_close.starts_with('(') && !after_close.starts_with('[') && !bracket_content.is_empty() {
+        return Some(bracket_content.to_lowercase());
+    }
+
+    None
+}
+
+/// Detect a reference definition on the current line: `[ref-id]: target.md#anchor`
+///
+/// Returns a `FullLinkTarget` if the line is a reference definition.
+fn detect_ref_definition(line: &str, flavor: MarkdownFlavor) -> Option<FullLinkTarget> {
+    let context = crate::lint_context::LintContext::new(line, flavor, None);
+    context
+        .reference_definitions()
+        .first()
+        .map(|definition| FullLinkTarget::from_destination(&definition.url))
+}
+
+/// Scan the document for a reference definition `[ref_id]: target` and
+/// return the parsed target.
+///
+/// Definitions inside fenced code blocks and code spans are skipped,
+/// matching CommonMark semantics.
+fn resolve_reference_to_target(text: &str, ref_id: &str, flavor: MarkdownFlavor) -> Option<FullLinkTarget> {
+    let context = crate::lint_context::LintContext::new(crate::utils::bom::strip_bom(text), flavor, None);
+    context.get_reference_url(ref_id).map(FullLinkTarget::from_destination)
+}
+
+/// Language hint for a fenced code block based on a file's extension.
+///
+/// Returns `None` for markdown files, whose preview should render as markdown
+/// rather than as fenced source.
+fn fence_language(file_path: &Path) -> Option<String> {
+    let ext = file_path.extension()?.to_str()?;
+    if matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "mdx" | "mkd" | "mdown" | "markdn"
+    ) {
+        return None;
+    }
+    Some(crate::code_block_tools::LinguistResolver::new().resolve(ext))
+}
+
+/// Wrap `content` in a fenced code block tagged with `lang`.
+///
+/// The fence is made longer than the longest backtick run inside `content`, so
+/// an embedded fence cannot terminate the block early.
+fn fence_code(content: &str, lang: &str) -> String {
+    let longest_backtick_run = content
+        .as_bytes()
+        .split(|&b| b != b'`')
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.max(2) + 1);
+    format!("{fence}{lang}\n{content}\n{fence}")
+}
+
+/// An excerpt of the markdown in `ctx` for a hover preview: lines from `begin`
+/// (0-indexed), at most `max_lines` of them, ending early before a heading at
+/// `stop_level` or above that starts at line `checks_from` or later.
+///
+/// A fenced code block the limit cuts off is closed with a fence carrying its
+/// opener's container prefix, so the preview's trailing text does not render
+/// as code. Returns the excerpt and whether the limit cut it.
+fn markdown_excerpt(
+    ctx: &crate::lint_context::LintContext,
+    begin: usize,
+    max_lines: usize,
+    stop_level: Option<u8>,
+    checks_from: usize,
+) -> (String, bool) {
+    let lines = ctx.raw_lines();
+    // The 1-indexed first text lines of the headings that end the section. A
+    // heading is recorded on its last line, so a multi-line Setext heading is
+    // keyed by the line its text starts on.
+    let section_ends: std::collections::HashSet<usize> = stop_level
+        .map(|stop| {
+            ctx.headings()
+                .filter(|parsed| parsed.heading.level <= stop)
+                .map(|parsed| parsed.first_line_num())
+                .collect()
+        })
+        .unwrap_or_default();
+    let ends_section = |line: usize| line >= checks_from && section_ends.contains(&(line + 1));
+    let mut end = begin;
+    while end < lines.len() && !ends_section(end) && end - begin < max_lines {
+        end += 1;
+    }
+    let truncated = end < lines.len() && !ends_section(end);
+
+    let mut excerpt = lines.get(begin..end).unwrap_or_default().join("\n");
+    if truncated && let Some(fence) = end.checked_sub(1).and_then(|last| closing_fence(ctx, last)) {
+        excerpt.push('\n');
+        excerpt.push_str(&fence);
+    }
+    (excerpt, truncated)
+}
+
+/// The fence closing the fenced code block that line `line` (0-indexed) is
+/// inside of and that continues past it, or `None` when there is no such block.
+fn closing_fence(ctx: &crate::lint_context::LintContext, line: usize) -> Option<String> {
+    let info = ctx.line_info(line + 1).filter(|info| info.in_code_block)?;
+    let line_end = info.byte_offset + info.byte_len;
+    // A block ends where its closing fence line does, so one ending past this
+    // line still has its closing fence to come.
+    let block = ctx
+        .code_block_details
+        .iter()
+        .find(|block| block.is_fenced && block.start <= info.byte_offset && line_end < block.end)?;
+    let (opener_line, _) = ctx.offset_to_line_col(block.start);
+    let opener = *ctx.raw_lines().get(opener_line.checked_sub(1)?)?;
+    let fence_start = opener.find(['`', '~'])?;
+    let fence_char = opener[fence_start..].chars().next()?;
+    let fence_len = opener[fence_start..].chars().take_while(|&c| c == fence_char).count();
+    // Blockquote markers and indentation continue the container; a list
+    // marker becomes the indentation of its continuation lines.
+    let prefix: String = opener[..fence_start]
+        .chars()
+        .map(|c| if c == '>' || c.is_whitespace() { c } else { ' ' })
+        .collect();
+    Some(format!("{prefix}{}", fence_char.to_string().repeat(fence_len)))
+}
+
+/// A line-number anchor parsed from a link fragment (`#L12` or `#L12-L24`).
+///
+/// Line numbers are 1-indexed, matching the `#L<n>` convention used by GitHub
+/// and editors.
+enum LineAnchor {
+    Single(usize),
+    Range(usize, usize),
+}
+
+/// Parse a `#L<n>` / `#L<n>-L<m>` fragment into a [`LineAnchor`].
+///
+/// Returns `None` for anything that is not a line anchor (so it falls through to
+/// heading resolution), and for malformed ranges (`m < n`) or a zero line number.
+fn parse_line_anchor(anchor: &str) -> Option<LineAnchor> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static LINE_ANCHOR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^L(\d+)(?:-L(\d+))?$").unwrap());
+
+    let caps = LINE_ANCHOR_RE.captures(anchor)?;
+    let start: usize = caps.get(1)?.as_str().parse().ok()?;
+    if start == 0 {
+        return None;
+    }
+    match caps.get(2) {
+        None => Some(LineAnchor::Single(start)),
+        Some(end) => {
+            let end: usize = end.as_str().parse().ok()?;
+            if end < start {
+                return None;
+            }
+            Some(LineAnchor::Range(start, end))
+        }
+    }
+}
+
+impl RumdlLanguageServer {
+    /// Handle `textDocument/definition` requests.
+    ///
+    /// When the cursor is on a markdown link `[text](target.md#anchor)`, resolves
+    /// the target file path and optional heading anchor, then returns a `Location`
+    /// pointing to the target.
+    pub(super) async fn handle_goto_definition(&self, uri: &Url, position: Position) -> Option<GotoDefinitionResponse> {
+        let text = self.get_document_content(uri).await?;
+        let flavor = self.resolve_flavor_for_uri(uri).await;
+
+        let link =
+            detect_full_link_target(&text, position).or_else(|| detect_ref_link_target(&text, position, flavor))?;
+
+        // External URLs have no local file to navigate to
+        if is_external_url(&link.file_path) {
+            return None;
+        }
+
+        self.resolve_link_target(uri, &link).await
+    }
+
+    /// Base path for resolving a link target's relative file path.
+    ///
+    /// For `file://` URIs this is the document's own resolved path, so a target
+    /// resolved against it is comparable with the workspace index. For non-file URIs
+    /// (unsaved buffers like `buffer:647`, `untitled:` documents) there is no
+    /// on-disk path, so relative links are anchored to the first workspace root.
+    /// Returns `None` when neither is available, so navigation degrades to a no-op.
+    ///
+    /// `resolve_link_path` resolves relative targets against the base's *parent*,
+    /// so a synthetic file name is hung off the workspace root to make the root the
+    /// parent directory.
+    async fn link_resolution_base(&self, uri: &Url) -> Option<PathBuf> {
+        if let Some(path) = super::resolve_uri(uri) {
+            return Some(path);
+        }
+        let root = self.workspace_roots.read().await.first().cloned()?;
+        Some(root.join("untitled.md"))
+    }
+
+    /// Handle `textDocument/hover` requests.
+    ///
+    /// When the cursor is on a markdown link, shows a preview of the target:
+    /// - External URLs: shows the URL
+    /// - Local files without anchor: shows the file path and first lines
+    /// - Local files with anchor: shows the heading and content below it
+    pub(super) async fn handle_hover(&self, uri: &Url, position: Position) -> Option<Hover> {
+        let text = self.get_document_content(uri).await?;
+        let flavor = self.resolve_flavor_for_uri(uri).await;
+
+        let link =
+            detect_full_link_target(&text, position).or_else(|| detect_ref_link_target(&text, position, flavor))?;
+
+        // External URLs: show the URL itself
+        if is_external_url(&link.file_path) {
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("**External link**\n\n{}", link.file_path),
+                }),
+                range: None,
+            });
+        }
+
+        let current_file = self.link_resolution_base(uri).await?;
+        let target_path = self.resolve_link_path(&current_file, &link.file_path).await?;
+
+        // Read target file content
+        let target_uri = Url::from_file_path(&target_path).ok()?;
+        let target_content = self.get_document_content(&target_uri).await?;
+
+        let target_flavor = self.resolve_flavor_for_uri(&target_uri).await;
+        let preview = if !link.anchor.is_empty() {
+            if let Some(line_anchor) = parse_line_anchor(&link.anchor) {
+                self.build_line_anchor_preview(&target_path, &line_anchor, &target_content)
+            } else {
+                self.build_anchor_preview(&target_path, &link.anchor, &target_content, target_flavor)
+                    .await
+            }
+        } else {
+            self.build_file_preview(&target_path, &target_content, target_flavor)
+        };
+
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: preview,
+            }),
+            range: None,
+        })
+    }
+
+    /// Build a hover preview for a link targeting a specific heading anchor.
+    ///
+    /// Names the file, then shows the heading and up to 15 lines of content
+    /// below it, stopping at the next heading of equal or higher level.
+    async fn build_anchor_preview(
+        &self,
+        file_path: &Path,
+        anchor: &str,
+        content: &str,
+        flavor: MarkdownFlavor,
+    ) -> String {
+        const MAX_LINES: usize = 15;
+
+        let display = file_path.file_name().unwrap_or(file_path.as_os_str()).to_string_lossy();
+        let not_found = || format!("**{display}**\n\n*Heading `#{anchor}` not found*");
+        let Some(heading) = self.resolve_heading(file_path, anchor).await else {
+            return not_found();
+        };
+
+        // Structure and line numbers are those of the text after a byte order mark.
+        let ctx = crate::lint_context::LintContext::new(crate::utils::bom::strip_bom(content), flavor, None);
+        let lines = ctx.raw_lines();
+        // The preview opens with the heading's own text, which a Setext
+        // underline can stretch across several lines.
+        let start = heading.first_line().saturating_sub(1);
+        if start >= lines.len() {
+            return not_found();
+        }
+
+        // The level is the one the parser recorded for the heading, which the
+        // source line alone does not give: a heading inside a list item or a
+        // blockquote starts with a marker, and a quoted setext underline starts
+        // with `>`. With no heading on the indexed line (the index is out of
+        // date) the section has no end to look for.
+        let heading_level = ctx.heading_on_line(heading.line).map(|parsed| parsed.heading.level);
+
+        // `heading.line` (1-indexed) is the heading's last text line, so the
+        // section's own lines end at index `heading.line`, its Setext underline.
+        let (excerpt, truncated) = markdown_excerpt(&ctx, start, MAX_LINES + 1, heading_level, heading.line);
+        let mut preview = format!("**{display}**\n\n{excerpt}");
+        if truncated {
+            preview.push_str("\n\n...");
+        }
+        preview
+    }
+
+    /// Build a hover preview for a link targeting a whole file (no anchor).
+    ///
+    /// Shows the file name and the first 15 lines of content. Non-markdown files
+    /// are wrapped in a fenced code block with a language hint so editors can
+    /// syntax-highlight the preview; markdown renders as-is, starting after its
+    /// front matter.
+    fn build_file_preview(&self, file_path: &Path, content: &str, flavor: MarkdownFlavor) -> String {
+        const MAX_LINES: usize = 15;
+
+        let display_path = file_path.file_name().unwrap_or(file_path.as_os_str());
+        let (body, truncated) = match fence_language(file_path) {
+            Some(lang) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let shown = lines.len().min(MAX_LINES);
+                (fence_code(&lines[..shown].join("\n"), &lang), lines.len() > MAX_LINES)
+            }
+            None => {
+                let ctx = crate::lint_context::LintContext::new(crate::utils::bom::strip_bom(content), flavor, None);
+                let begin = (1..=ctx.raw_lines().len())
+                    .find(|&n| {
+                        ctx.line_info(n)
+                            .is_some_and(|info| !info.in_front_matter && !info.is_blank)
+                    })
+                    .map_or(ctx.raw_lines().len(), |n| n - 1);
+                markdown_excerpt(&ctx, begin, MAX_LINES, None, 0)
+            }
+        };
+
+        let mut preview = format!("**{}**\n\n{}", display_path.to_string_lossy(), body);
+        if truncated {
+            preview.push_str("\n\n...");
+        }
+        preview
+    }
+
+    /// Build a hover preview for a link targeting specific line numbers.
+    ///
+    /// `#L<n>` shows the line with five lines of context on each side; `#L<n>-L<m>`
+    /// shows the range (capped at 15 lines). The slice is fenced with a language
+    /// hint when the target is not markdown.
+    fn build_line_anchor_preview(&self, file_path: &Path, anchor: &LineAnchor, content: &str) -> String {
+        const CONTEXT: usize = 5;
+        const MAX_RANGE_LINES: usize = 15;
+
+        // The mark is an encoding marker: quoted as text it would become content.
+        let lines: Vec<&str> = crate::utils::bom::strip_bom(content).lines().collect();
+        let total = lines.len();
+        let display = file_path.file_name().unwrap_or(file_path.as_os_str()).to_string_lossy();
+
+        let requested_start = match anchor {
+            LineAnchor::Single(n) | LineAnchor::Range(n, _) => *n,
+        };
+        if requested_start > total {
+            let unit = if total == 1 { "line" } else { "lines" };
+            return format!("**{display}**\n\n*Line {requested_start} is past the end of the file ({total} {unit})*");
+        }
+
+        let (start_1, end_1, label) = match anchor {
+            LineAnchor::Single(n) => {
+                let start = n.saturating_sub(CONTEXT).max(1);
+                let end = (n + CONTEXT).min(total);
+                (start, end, format!("line {n}"))
+            }
+            LineAnchor::Range(a, b) => {
+                let end = (*b).min(total).min(a + MAX_RANGE_LINES - 1);
+                (*a, end, format!("lines {a}-{b}"))
+            }
+        };
+
+        let slice = lines[start_1 - 1..end_1].join("\n");
+        let body = match fence_language(file_path) {
+            Some(lang) => fence_code(&slice, &lang),
+            None => slice,
+        };
+        format!("**{display}** ({label})\n\n{body}")
+    }
+
+    /// Handle `textDocument/references` requests.
+    ///
+    /// When the cursor is on a heading, finds all links across the workspace that
+    /// reference this heading. When the cursor is on a link, finds all other links
+    /// that point to the same target.
+    pub(super) async fn handle_references(&self, uri: &Url, position: Position) -> Option<Vec<Location>> {
+        let text = self.get_document_content(uri).await?;
+        let current_file = super::resolve_uri(uri)?;
+        let flavor = self.resolve_flavor_for_uri(uri).await;
+
+        // Check if cursor is on a heading by consulting the workspace index.
+        // This avoids false positives from `#` lines inside code blocks.
+        let heading_line_1indexed = (position.line as usize) + 1;
+        let heading_anchor = {
+            let index = self.workspace_index.read().await;
+            index.get_file(&current_file).and_then(|file_index| {
+                file_index
+                    .headings
+                    .iter()
+                    .find(|h| h.covers_line(heading_line_1indexed))
+                    .map(|h| h.custom_anchor.clone().unwrap_or_else(|| h.auto_anchor.clone()))
+            })
+        };
+
+        if let Some(anchor) = heading_anchor {
+            // Find cross-file references
+            let mut locations = self
+                .find_references_to_target(&current_file, &anchor)
+                .await
+                .unwrap_or_default();
+
+            // Also find same-file fragment-only links (e.g., [text](#anchor))
+            let same_file = find_same_file_fragment_links(&text, uri, &anchor);
+            locations.extend(same_file);
+
+            return if locations.is_empty() { None } else { Some(locations) };
+        }
+
+        // Check if cursor is on a link (inline or reference-style)
+        if let Some(link) =
+            detect_full_link_target(&text, position).or_else(|| detect_ref_link_target(&text, position, flavor))
+        {
+            // External URLs have no local file to find references for
+            if is_external_url(&link.file_path) {
+                return None;
+            }
+
+            let target_path = self.resolve_link_path(&current_file, &link.file_path).await?;
+
+            return self.find_references_to_target(&target_path, &link.anchor).await;
+        }
+
+        // Fallback: find all cross-file references pointing to the current file,
+        // regardless of fragment. This handles the common case where a user opens
+        // a target file and invokes find-references to discover what links to it.
+        self.find_all_references_to_file(&current_file).await
+    }
+
+    /// Find all links across the workspace that point to `target_file`,
+    /// regardless of the fragment/anchor.
+    ///
+    /// This is the fallback for find-references when the cursor is not on a
+    /// heading or a link: it returns every cross-file link whose resolved path
+    /// matches `target_file`.
+    async fn find_all_references_to_file(&self, target_file: &Path) -> Option<Vec<Location>> {
+        let content_roots = self.resolve_content_roots().await;
+        let index = self.workspace_index.read().await;
+        let mut locations = Vec::new();
+
+        for (source_path, file_index) in index.files() {
+            let source_dir = source_path.parent().unwrap_or(Path::new(""));
+
+            let matching_links: Vec<_> = file_index
+                .cross_file_links
+                .iter()
+                .filter(|link| link.is_navigable() && link_target_file(source_dir, &link.target_path) == *target_file)
+                .chain(
+                    file_index
+                        .root_relative_links
+                        .iter()
+                        .filter(|link| root_relative_link_resolves(&content_roots, &link.target_path, target_file)),
+                )
+                .collect();
+
+            if matching_links.is_empty() {
+                continue;
+            }
+
+            let Ok(source_uri) = Url::from_file_path(source_path) else {
+                continue;
+            };
+
+            let source_content = crate::lsp::read_markdown_lossy(source_path).await.ok();
+            let source_lines: Vec<&str> = source_content
+                .as_deref()
+                .map(|c| c.lines().collect())
+                .unwrap_or_default();
+
+            locations.extend(
+                matching_links
+                    .into_iter()
+                    .map(|link| reference_location(&source_uri, &source_lines, link)),
+            );
+        }
+
+        if locations.is_empty() { None } else { Some(locations) }
+    }
+
+    /// Resolve a `FullLinkTarget` to a `GotoDefinitionResponse`.
+    ///
+    /// Shared between inline links and reference-style links to avoid
+    /// duplicating the path resolution and heading lookup logic.
+    async fn resolve_link_target(&self, uri: &Url, link: &FullLinkTarget) -> Option<GotoDefinitionResponse> {
+        let current_file = self.link_resolution_base(uri).await?;
+        let target_path = self.resolve_link_path(&current_file, &link.file_path).await?;
+
+        let target_uri = Url::from_file_path(&target_path).ok()?;
+
+        // Line anchors (`#L12`, `#L5-L8`) take precedence over heading-anchor
+        // resolution, matching hover's interpretation of the same fragment.
+        let target_line = if link.anchor.is_empty() {
+            0
+        } else if let Some(line_anchor) = parse_line_anchor(&link.anchor) {
+            let (LineAnchor::Single(start) | LineAnchor::Range(start, _)) = line_anchor;
+            // Line anchors are 1-indexed; LSP is 0-indexed.
+            start.saturating_sub(1) as u32
+        } else {
+            self.resolve_heading_line(&target_path, &link.anchor).await.unwrap_or(0)
+        };
+
+        let target_position = Position {
+            line: target_line,
+            character: 0,
+        };
+        let range = Range {
+            start: target_position,
+            end: target_position,
+        };
+
+        Some(GotoDefinitionResponse::Scalar(Location { uri: target_uri, range }))
+    }
+
+    /// Look up a heading's line number (0-indexed for LSP) in the workspace index.
+    ///
+    /// Targets outside the indexed workspace (e.g. a content root configured via
+    /// `linkCompletionContentRoots` that lives elsewhere) are parsed from disk so
+    /// anchor navigation lands on the heading rather than the top of the file,
+    /// matching the on-disk anchor completion that suggested the link.
+    async fn resolve_heading(&self, file_path: &Path, anchor: &str) -> Option<HeadingIndex> {
+        let indexed = {
+            let index = self.workspace_index.read().await;
+            index
+                .get_file(file_path)
+                .and_then(|file_index| file_index.get_heading_by_anchor(anchor).cloned())
+        };
+
+        match indexed {
+            Some(heading) => Some(heading),
+            None => {
+                let content = crate::lsp::read_markdown_lossy(file_path).await.ok()?;
+                // The file's own scope, not the workspace root's: a target under a
+                // nested config generates its anchors from that config, and the
+                // index the scan built for it would have used the same one.
+                let config = self.config_resolver.resolve_effective_config_for_file(file_path).await;
+                let rules = crate::lsp::index_worker::cross_file_rules(&config);
+                let flavor = config.get_flavor_for_file(file_path);
+                let file_index = crate::build_file_index_only_with_config(
+                    &content,
+                    &rules,
+                    flavor,
+                    Some(file_path.to_path_buf()),
+                    &config,
+                );
+                file_index.get_heading_by_anchor(anchor).cloned()
+            }
+        }
+    }
+
+    /// The 0-based line a heading anchor resolves to: the first line of the
+    /// heading text, which a Setext underline can put several lines above the
+    /// line the heading is indexed on.
+    async fn resolve_heading_line(&self, file_path: &Path, anchor: &str) -> Option<u32> {
+        let heading = self.resolve_heading(file_path, anchor).await?;
+        Some((heading.first_line().saturating_sub(1)) as u32)
+    }
+
+    /// Find all links across the workspace that point to `target_path` with
+    /// the given `fragment` (anchor).
+    ///
+    /// An empty fragment matches links that target the file without an anchor.
+    async fn find_references_to_target(&self, target_path: &Path, fragment: &str) -> Option<Vec<Location>> {
+        // Resolved before the index lock so root-relative links can be matched
+        // against content roots without re-acquiring the workspace index lock.
+        let content_roots = self.resolve_content_roots().await;
+        let index = self.workspace_index.read().await;
+        let mut locations = Vec::new();
+
+        for (source_path, file_index) in index.files() {
+            let source_dir = source_path.parent().unwrap_or(Path::new(""));
+
+            // Collect matching links for this file before loading content. Both
+            // directory-relative and root-relative links are considered so a link
+            // resolves to references the same way it resolves to a definition.
+            let matching_links: Vec<_> = file_index
+                .cross_file_links
+                .iter()
+                .filter(|link| {
+                    link.is_navigable()
+                        && link_target_file(source_dir, &link.target_path) == *target_path
+                        && link.fragment.eq_ignore_ascii_case(fragment)
+                })
+                .chain(file_index.root_relative_links.iter().filter(|link| {
+                    link.fragment.eq_ignore_ascii_case(fragment)
+                        && root_relative_link_resolves(&content_roots, &link.target_path, target_path)
+                }))
+                .collect();
+
+            if matching_links.is_empty() {
+                continue;
+            }
+
+            let Ok(source_uri) = Url::from_file_path(source_path) else {
+                continue;
+            };
+
+            // Load source content for byte→UTF-16 column conversion.
+            // We read the file directly instead of using get_document_content
+            // to avoid acquiring additional locks while holding the workspace
+            // index read lock.
+            let source_content = crate::lsp::read_markdown_lossy(source_path).await.ok();
+            let source_lines: Vec<&str> = source_content
+                .as_deref()
+                .map(|c| c.lines().collect())
+                .unwrap_or_default();
+
+            locations.extend(
+                matching_links
+                    .into_iter()
+                    .map(|link| reference_location(&source_uri, &source_lines, link)),
+            );
+        }
+
+        if locations.is_empty() { None } else { Some(locations) }
+    }
+
+    // =========================================================================
+    // Rename support
+    // =========================================================================
+
+    /// Handle `textDocument/prepareRename` requests.
+    ///
+    /// Validates that the cursor is on a heading and returns the renameable
+    /// text range (excluding `#` markers, leading whitespace, and custom anchors).
+    pub(super) async fn handle_prepare_rename(&self, uri: &Url, position: Position) -> Option<PrepareRenameResponse> {
+        let text = self.get_document_content(uri).await?;
+        let current_file = super::resolve_uri(uri)?;
+
+        let heading_line_1indexed = (position.line as usize) + 1;
+
+        let heading_info = {
+            let index = self.workspace_index.read().await;
+            index.get_file(&current_file).and_then(|file_index| {
+                file_index
+                    .headings
+                    .iter()
+                    .find(|h| h.covers_line(heading_line_1indexed))
+                    .cloned()
+            })
+        }?;
+
+        let flavor = self.resolve_flavor_for_uri(uri).await;
+        let lines: Vec<&str> = text.lines().collect();
+        let prefix_len = heading_prefix_len(&text, flavor, &heading_info)?;
+        Some(PrepareRenameResponse::Range(heading_text_range(
+            &lines,
+            &heading_info,
+            prefix_len,
+        )?))
+    }
+
+    /// Handle `textDocument/rename` requests.
+    ///
+    /// When a heading is renamed, generates a `WorkspaceEdit` that:
+    /// 1. Replaces the heading text in the source file
+    /// 2. Updates all cross-file links referencing the old anchor
+    /// 3. Updates all same-file fragment links referencing the old anchor
+    ///
+    /// If the heading has a custom anchor (`{#id}`), only the heading text is
+    /// changed — links reference the custom ID which remains unchanged.
+    pub(super) async fn handle_rename(&self, uri: &Url, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
+        // Reject empty or whitespace-only names
+        if new_name.trim().is_empty() {
+            return None;
+        }
+
+        let text = self.get_document_content(uri).await?;
+        let current_file = super::resolve_uri(uri)?;
+
+        let heading_line_1indexed = (position.line as usize) + 1;
+
+        let heading_info = {
+            let index = self.workspace_index.read().await;
+            index.get_file(&current_file).and_then(|file_index| {
+                file_index
+                    .headings
+                    .iter()
+                    .find(|h| h.covers_line(heading_line_1indexed))
+                    .cloned()
+            })
+        }?;
+
+        let has_custom_anchor = heading_info.custom_anchor.is_some();
+        let old_anchor = heading_info
+            .custom_anchor
+            .as_deref()
+            .unwrap_or(&heading_info.auto_anchor);
+
+        let flavor = self.resolve_flavor_for_uri(uri).await;
+        let lines: Vec<&str> = text.lines().collect();
+        // The edit covers the whole heading text, so renaming a Setext heading
+        // whose paragraph spans several lines leaves the new name on one line.
+        let prefix_len = heading_prefix_len(&text, flavor, &heading_info)?;
+        let text_range = heading_text_range(&lines, &heading_info, prefix_len)?;
+
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        // Edit 1: Replace heading text
+        changes.entry(uri.clone()).or_default().push(TextEdit {
+            range: text_range,
+            new_text: new_name.to_string(),
+        });
+
+        // If heading has a custom anchor, links reference the custom ID.
+        // Renaming the heading text doesn't change the anchor, so no link updates needed.
+        if has_custom_anchor {
+            return Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            });
+        }
+
+        let new_anchor = AnchorStyle::GitHub.generate_fragment(new_name);
+
+        // Check for anchor collision with existing headings in the same file
+        {
+            let index = self.workspace_index.read().await;
+            if let Some(file_index) = index.get_file(&current_file) {
+                let collision = file_index.headings.iter().any(|h| {
+                    !h.covers_line(heading_line_1indexed)
+                        && (h.auto_anchor.eq_ignore_ascii_case(&new_anchor)
+                            || h.custom_anchor
+                                .as_deref()
+                                .is_some_and(|ca| ca.eq_ignore_ascii_case(&new_anchor)))
+                });
+                if collision {
+                    log::warn!("Rename refused: anchor '{new_anchor}' would collide with existing heading");
+                    return None;
+                }
+            }
+        }
+
+        // Collect cross-file link data while holding the lock, then release it
+        let cross_file_matches = self.collect_cross_file_link_matches(&current_file, old_anchor).await;
+
+        // Process cross-file matches (file I/O without holding the lock)
+        for (source_path, matching_links) in &cross_file_matches {
+            // Skip the current file — same-file links are handled separately
+            if *source_path == current_file {
+                continue;
+            }
+
+            let Ok(source_uri) = Url::from_file_path(source_path) else {
+                continue;
+            };
+
+            // Try editor buffer first, fall back to disk
+            let source_content = if let Some(content) = self.get_open_document_content(&source_uri).await {
+                content
+            } else {
+                match crate::lsp::read_markdown_lossy(source_path).await {
+                    // Closed files open in an editor without the encoding BOM.
+                    Ok(c) => crate::utils::bom::strip_bom(&c).to_string(),
+                    Err(_) => continue,
+                }
+            };
+
+            let source_lines: Vec<&str> = source_content.lines().collect();
+
+            // Group links by line to avoid duplicate edits when multiple links
+            // on the same line reference the same anchor
+            let mut seen_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for link in matching_links {
+                let line_idx = link.line.saturating_sub(1);
+                if !seen_lines.insert(line_idx) {
+                    continue; // already processed this line
+                }
+                let Some(line_content) = source_lines.get(line_idx) else {
+                    continue;
+                };
+
+                let edits = find_all_anchor_edits_in_link(line_content, line_idx as u32, old_anchor, &new_anchor);
+                changes.entry(source_uri.clone()).or_default().extend(edits);
+            }
+        }
+
+        // Same-file fragment links (#anchor)
+        collect_same_file_anchor_edits(uri, &text, old_anchor, &new_anchor, &mut changes);
+
+        // Same-file reference definitions ([ref]: #anchor)
+        collect_same_file_ref_def_edits(uri, &text, old_anchor, &new_anchor, &mut changes);
+
+        Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        })
+    }
+
+    /// Collect cross-file link matches from the workspace index.
+    ///
+    /// Returns the data needed to compute edits without holding the lock
+    /// during file I/O.
+    async fn collect_cross_file_link_matches(
+        &self,
+        target_path: &Path,
+        old_anchor: &str,
+    ) -> Vec<(PathBuf, Vec<crate::workspace_index::CrossFileLinkIndex>)> {
+        let content_roots = self.resolve_content_roots().await;
+        let index = self.workspace_index.read().await;
+        let mut result = Vec::new();
+
+        for (source_path, file_index) in index.files() {
+            let source_dir = source_path.parent().unwrap_or(Path::new(""));
+
+            let matching: Vec<_> = file_index
+                .cross_file_links
+                .iter()
+                .filter(|link| {
+                    link_target_file(source_dir, &link.target_path) == *target_path
+                        && link.fragment.eq_ignore_ascii_case(old_anchor)
+                })
+                .chain(file_index.root_relative_links.iter().filter(|link| {
+                    link.fragment.eq_ignore_ascii_case(old_anchor)
+                        && root_relative_link_resolves(&content_roots, &link.target_path, target_path)
+                }))
+                .cloned()
+                .collect();
+
+            if !matching.is_empty() {
+                result.push((source_path.to_path_buf(), matching));
+            }
+        }
+
+        result
+    }
+}
+
+/// Find the byte offset where ATX heading text starts (after `#` markers and space).
+fn find_heading_text_start(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+    let leading_ws = line.len() - trimmed.len();
+    let hash_count = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if hash_count > 6 {
+        return None;
+    }
+    let after_hashes = leading_ws + hash_count;
+    // ATX headings require a space or tab after #
+    if matches!(line.as_bytes().get(after_hashes), Some(b' ' | b'\t')) {
+        Some(after_hashes + 1)
+    } else if after_hashes == line.len() {
+        // Empty heading: just "##"
+        Some(after_hashes)
+    } else {
+        None
+    }
+}
+
+/// Find the byte offset where ATX heading text ends.
+///
+/// Handles:
+/// - Custom anchor syntax `{#id}` at end of heading
+/// - Closing ATX markers (`## Heading ##`)
+fn find_heading_text_end(line: &str, text_start: usize) -> usize {
+    let text_portion = &line[text_start..];
+    // Strip a trailing `{#custom-id}` first, then a closing ATX sequence, so a
+    // heading that uses both (`## Title ## {#id}`) yields just `Title`.
+    let without_id = strip_trailing_custom_id(text_portion);
+    text_start + strip_closing_atx(without_id).len()
+}
+
+/// `text` without a trailing closing ATX sequence (` ###`).
+///
+/// The hash run must be preceded by a space or tab, and followed only by spaces
+/// and tabs, to count as a closing sequence (CommonMark 4.2), so a heading whose
+/// text legitimately ends in `#` (e.g. `C#`) or in `#` and another kind of
+/// whitespace is preserved. What is left is trimmed of trailing whitespace the
+/// way the heading's display text is.
+fn strip_closing_atx(text: &str) -> &str {
+    let trimmed = text.trim_end_matches([' ', '\t']);
+    if let Some(last_non_hash) = trimmed.rfind(|c: char| c != '#') {
+        let tail = &trimmed[last_non_hash..];
+        if tail.starts_with([' ', '\t']) && tail.len() > 1 {
+            return trimmed[..last_non_hash].trim_end();
+        }
+    }
+    trimmed.trim_end()
+}
+
+/// Length of everything before the heading's own syntax on its first line:
+/// the list markers and quote markers of the containers it is written in.
+/// `None` when the document no longer holds a heading where the index says.
+fn heading_prefix_len(text: &str, flavor: MarkdownFlavor, heading: &HeadingIndex) -> Option<usize> {
+    // The heading is parsed from the text after the byte order mark, and the
+    // prefix is returned as a length into the first line of `text` itself.
+    let ctx = crate::lint_context::LintContext::new(crate::utils::bom::strip_bom(text), flavor, None);
+    let parsed = ctx.heading_on_line(heading.line)?;
+    // The index can lag the buffer by its debounce window. A heading of another
+    // shape on the indexed line would make the range cut into unrelated text.
+    let same_shape = parsed.is_setext() == heading.is_setext
+        && parsed.heading.text_lines == heading.text_lines.max(1)
+        && parsed.heading.text == heading.text;
+    let mark_bytes = if parsed.first_line_num() == 1 {
+        crate::utils::bom::bom_len(text)
+    } else {
+        0
+    };
+    same_shape.then(|| parsed.heading.first_line_prefix_len() + mark_bytes)
+}
+
+/// LSP range of an indexed heading's *text* within `lines`.
+///
+/// `prefix_len` is the length of the container markers (`- `, `> `) that
+/// precede the heading's own syntax on its first line; the range starts after
+/// them, so a rename leaves the list item or quote in place.
+///
+/// For ATX headings the markers, any closing `###` sequence, and a trailing
+/// `{#custom-id}` are excluded. The text of a Setext heading is the whole
+/// paragraph its underline ends, so the range starts on the paragraph's first
+/// line and ends on its last. Returns `None` when the heading's lines are
+/// missing or an ATX heading like `##` holds no text.
+fn heading_text_range(lines: &[&str], heading: &HeadingIndex, prefix_len: usize) -> Option<Range> {
+    let first_idx = heading.first_line().checked_sub(1)?;
+    let last_idx = heading.line.checked_sub(1)?;
+    let first_line = *lines.get(first_idx)?;
+    let last_line = *lines.get(last_idx)?;
+
+    let own_syntax = first_line.get(prefix_len..)?;
+    let start = prefix_len
+        + if heading.is_setext {
+            own_syntax.len() - own_syntax.trim_start().len()
+        } else {
+            find_heading_text_start(own_syntax)?
+        };
+    let end = if heading.is_setext {
+        strip_trailing_custom_id(&last_line[..last_line.trim_end().len()])
+            .trim_end()
+            .len()
+    } else {
+        find_heading_text_end(last_line, start)
+    };
+    if first_idx == last_idx && start >= end {
+        return None;
+    }
+
+    Some(Range {
+        start: Position {
+            line: first_idx as u32,
+            character: byte_to_utf16_offset(first_line, start),
+        },
+        end: Position {
+            line: last_idx as u32,
+            character: byte_to_utf16_offset(last_line, end),
+        },
+    })
+}
+
+/// `text` with a trailing `{#custom-id}` removed (and the spaces and tabs before
+/// it trimmed). Returns `text` unchanged when there is no such suffix.
+fn strip_trailing_custom_id(text: &str) -> &str {
+    if let Some(brace_pos) = text.rfind("{#")
+        && let Some(close_rel) = text[brace_pos..].find('}')
+        && text[brace_pos + close_rel + 1..].trim().is_empty()
+    {
+        return text[..brace_pos].trim_end_matches([' ', '\t']);
+    }
+    text
+}
+
+/// Find ALL `#anchor` occurrences inside links on a given line and create TextEdits.
+///
+/// Searches specifically within the URL portion of links (after `](` or after `]: `)
+/// to avoid matching `#` in link display text. Returns all matches, not just the first.
+fn find_all_anchor_edits_in_link(line: &str, line_num: u32, old_anchor: &str, new_anchor: &str) -> Vec<TextEdit> {
+    let target = format!("#{old_anchor}");
+    let target_lower = target.to_lowercase();
+    let mut edits = Vec::new();
+
+    // Search for the anchor in the URL portion of links
+    // Look for ](url#anchor) patterns
+    let mut search_start = 0;
+    while search_start < line.len() {
+        // Find the next `](` which starts a link URL
+        if let Some(paren_start) = line[search_start..].find("](") {
+            let url_start = search_start + paren_start + 2;
+            // Find the closing `)`
+            if let Some(paren_end) = line[url_start..].find(')') {
+                let url_portion = &line[url_start..url_start + paren_end];
+                if let Some(hash_pos) = url_portion.to_lowercase().find(&target_lower) {
+                    let anchor_start = url_start + hash_pos + 1; // after #
+                    let anchor_end = anchor_start + old_anchor.len();
+
+                    let start_char = byte_to_utf16_offset(line, anchor_start);
+                    let end_char = byte_to_utf16_offset(line, anchor_end);
+
+                    edits.push(TextEdit {
+                        range: Range {
+                            start: Position {
+                                line: line_num,
+                                character: start_char,
+                            },
+                            end: Position {
+                                line: line_num,
+                                character: end_char,
+                            },
+                        },
+                        new_text: new_anchor.to_string(),
+                    });
+                }
+                search_start = url_start + paren_end + 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Also check reference definitions: [ref]: file.md#anchor
+    if let Some(colon_pos) = line.find("]: ") {
+        let def_target = &line[colon_pos + 3..];
+        if let Some(hash_pos) = def_target.to_lowercase().find(&target_lower) {
+            let anchor_start = colon_pos + 3 + hash_pos + 1; // after #
+            let anchor_end = anchor_start + old_anchor.len();
+            if anchor_end <= line.len() {
+                let start_char = byte_to_utf16_offset(line, anchor_start);
+                let end_char = byte_to_utf16_offset(line, anchor_end);
+
+                edits.push(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: line_num,
+                            character: start_char,
+                        },
+                        end: Position {
+                            line: line_num,
+                            character: end_char,
+                        },
+                    },
+                    new_text: new_anchor.to_string(),
+                });
+            }
+        }
+    }
+
+    edits
+}
+
+/// Collect text edits for same-file fragment-only links (`[text](#anchor)`).
+///
+/// Uses pulldown-cmark to parse links, then searches within the URL portion
+/// for the fragment to replace.
+fn collect_same_file_anchor_edits(
+    uri: &Url,
+    carrier: &str,
+    old_anchor: &str,
+    new_anchor: &str,
+    changes: &mut HashMap<Url, Vec<TextEdit>>,
+) {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    // Parsed after the byte order mark; the editor's first line starts with it.
+    let content = crate::utils::bom::strip_bom(carrier);
+    let mark_units = crate::utils::bom::utf16_len(carrier);
+
+    let options = crate::utils::parser_options::rumdl_parser_options_for(content);
+
+    let parser = Parser::new_ext(content, options).into_offset_iter();
+
+    for (event, range) in parser {
+        if let Event::Start(Tag::Link { dest_url, .. }) = event
+            && let Some(frag) = dest_url.strip_prefix('#')
+            && frag.eq_ignore_ascii_case(old_anchor)
+        {
+            // Find the `#fragment` in the raw source within the link range
+            let link_source = &content[range.start..range.end];
+            if let Some(anchor_byte_in_source) = find_fragment_in_link_source(link_source, old_anchor) {
+                let anchor_start_byte = range.start + anchor_byte_in_source;
+                let anchor_end_byte = anchor_start_byte + old_anchor.len();
+
+                let line_idx = content[..anchor_start_byte].matches('\n').count();
+                let line_start = content[..anchor_start_byte].rfind('\n').map_or(0, |p| p + 1);
+                let line_end = content[line_start..]
+                    .find('\n')
+                    .map_or(content.len(), |p| line_start + p);
+                let line_text = &content[line_start..line_end];
+
+                let shift = if line_idx == 0 { mark_units } else { 0 };
+                let start_char = byte_to_utf16_offset(line_text, anchor_start_byte - line_start) + shift;
+                let end_char = byte_to_utf16_offset(line_text, anchor_end_byte - line_start) + shift;
+
+                changes.entry(uri.clone()).or_default().push(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: line_idx as u32,
+                            character: start_char,
+                        },
+                        end: Position {
+                            line: line_idx as u32,
+                            character: end_char,
+                        },
+                    },
+                    new_text: new_anchor.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Find the anchor text position within a link's raw source.
+///
+/// For inline links like `[text](#anchor)`, searches after `(#`.
+/// For reference definitions resolved by pulldown-cmark, the raw source
+/// includes the `[text]` portion, so we search for `#anchor` within `(...)`.
+/// Falls back to finding `#anchor` after any `(` or `]: ` pattern.
+fn find_fragment_in_link_source(source: &str, anchor: &str) -> Option<usize> {
+    let target = format!("#{anchor}");
+    let target_lower = target.to_lowercase();
+
+    // Try inline link: find `(#anchor` within `(...)`
+    if let Some(paren_pos) = source.find('(') {
+        let after_paren = &source[paren_pos + 1..];
+        if let Some(hash_pos) = after_paren.to_lowercase().find(&target_lower) {
+            // Return position of anchor text (after #)
+            return Some(paren_pos + 1 + hash_pos + 1);
+        }
+    }
+
+    // Fallback: search anywhere in the source (for edge cases)
+    if let Some(pos) = source.to_lowercase().find(&target_lower) {
+        return Some(pos + 1); // after #
+    }
+
+    None
+}
+
+/// Collect text edits for same-file reference definitions that point to fragments.
+///
+/// Handles lines like `[ref]: #anchor` where the anchor needs updating.
+fn collect_same_file_ref_def_edits(
+    uri: &Url,
+    content: &str,
+    old_anchor: &str,
+    new_anchor: &str,
+    changes: &mut HashMap<Url, Vec<TextEdit>>,
+) {
+    let target = format!("#{old_anchor}");
+    let target_lower = target.to_lowercase();
+
+    for (line_idx, line) in content.lines().enumerate() {
+        // Match reference definition pattern: [ref]: #anchor
+        let trimmed = if line_idx == 0 {
+            crate::utils::bom::strip_bom(line)
+        } else {
+            line
+        }
+        .trim_start();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        if let Some(colon_pos) = trimmed.find("]: ") {
+            let def_target = trimmed[colon_pos + 3..].trim();
+            // Only fragment-only definitions
+            if let Some(frag) = def_target.strip_prefix('#') {
+                // Strip any trailing title
+                let frag = frag.split_whitespace().next().unwrap_or(frag);
+                if frag.eq_ignore_ascii_case(old_anchor) {
+                    // Find the position in the original line
+                    if let Some(hash_pos) = line.to_lowercase().find(&target_lower) {
+                        let anchor_start = hash_pos + 1;
+                        let anchor_end = anchor_start + old_anchor.len();
+
+                        let start_char = byte_to_utf16_offset(line, anchor_start);
+                        let end_char = byte_to_utf16_offset(line, anchor_end);
+
+                        changes.entry(uri.clone()).or_default().push(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: line_idx as u32,
+                                    character: start_char,
+                                },
+                                end: Position {
+                                    line: line_idx as u32,
+                                    character: end_char,
+                                },
+                            },
+                            new_text: new_anchor.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reference_definition_behind_a_mark_resolves_and_renames() {
+        let text = "\u{feff}[ref]: guide.md#old\n\n[x][ref]\n";
+        let target = resolve_reference_to_target(text, "ref", MarkdownFlavor::Standard).expect("definition resolves");
+        assert_eq!(target.file_path, "guide.md");
+        assert_eq!(target.anchor, "old");
+        let cursor = Position { line: 0, character: 3 };
+        let found = detect_ref_link_target(text, cursor, MarkdownFlavor::Standard).expect("definition line");
+        assert_eq!(found.file_path, "guide.md");
+        // A mark that is not at the start of the document is ordinary text.
+        let later = "# T\n\n\u{feff}[ref]: guide.md\n";
+        let cursor = Position { line: 2, character: 3 };
+        assert!(detect_ref_link_target(later, cursor, MarkdownFlavor::Standard).is_none());
+
+        let uri = Url::parse("file:///t.md").unwrap();
+        let mut changes = HashMap::new();
+        let text = "\u{feff}[ref]: #old\n\n[x][ref]\n";
+        collect_same_file_ref_def_edits(&uri, text, "old", "new", &mut changes);
+        let edit = &changes.get(&uri).expect("an edit for the definition")[0];
+        // "#" is at char 7 of "[ref]: #old" and the editor line holds the mark first.
+        assert_eq!((edit.range.start.line, edit.range.start.character), (0, 9));
+    }
+
+    #[test]
+    fn same_file_fragment_links_behind_a_mark_are_found_and_shifted() {
+        let uri = Url::parse("file:///t.md").unwrap();
+        let text = "\u{feff}[ref]: #old\n\n# Old\n\n[x][ref] and [y](#old)\n";
+        let found = find_same_file_fragment_links(text, &uri, "old");
+        // The shortcut-style use and the inline link; the definition itself is not a link.
+        assert_eq!(found.len(), 2, "{found:?}");
+        let first_line = find_same_file_fragment_links("\u{feff}[a](#old)\n", &uri, "old");
+        assert_eq!(first_line.len(), 1);
+        assert_eq!(first_line[0].range.start.character, 1);
+        let mut changes = HashMap::new();
+        collect_same_file_anchor_edits(&uri, "\u{feff}[a](#old)\n", "old", "new", &mut changes);
+        let edit = &changes[&uri][0];
+        // "[a](#" is five characters, the mark one more.
+        assert_eq!((edit.range.start.line, edit.range.start.character), (0, 6));
+    }
+
+    #[tokio::test]
+    async fn a_line_preview_does_not_quote_the_mark_of_the_first_line() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| RumdlLanguageServer::new(client, None));
+        let preview = service.inner().build_line_anchor_preview(
+            Path::new("a.md"),
+            &LineAnchor::Single(1),
+            "\u{feff}# Title\nbody\n",
+        );
+        assert!(!preview.contains('\u{feff}'), "{preview:?}");
+        assert!(preview.contains("# Title"), "{preview:?}");
+    }
+
+    #[tokio::test]
+    async fn previews_skip_front_matter_behind_a_mark() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| RumdlLanguageServer::new(client, None));
+        let preview = service.inner().build_file_preview(
+            Path::new("a.md"),
+            "\u{feff}---\ntitle: secret\n---\n\nBody text\n",
+            MarkdownFlavor::Standard,
+        );
+        assert!(preview.contains("Body text"), "{preview}");
+        assert!(!preview.contains("secret"), "{preview}");
+    }
+
+    #[test]
+    fn a_disk_reference_location_omits_its_encoding_mark() {
+        let uri = Url::parse("file:///t.md").unwrap();
+        let link = CrossFileLinkIndex {
+            target_path: "a.md".to_string(),
+            fragment: String::new(),
+            line: 1,
+            column: 2,
+            origin: crate::workspace_index::LinkOrigin::Body,
+        };
+        let marked = reference_location(&uri, &["\u{feff}😀[a](b.md)"], &link);
+        let plain = reference_location(&uri, &["😀[a](b.md)"], &link);
+        assert_eq!(plain.range.start.character, 2);
+        assert_eq!(marked.range.start.character, plain.range.start.character);
+    }
+
+    #[test]
+    fn the_heading_prefix_on_a_marked_first_line_includes_the_mark() {
+        let index = |text: &str| {
+            let ctx = crate::lint_context::LintContext::new(
+                crate::utils::bom::strip_bom(text),
+                MarkdownFlavor::Standard,
+                None,
+            );
+            let heading = ctx.heading_on_line(1).expect("heading on line 1");
+            HeadingIndex {
+                text: heading.heading.text.clone(),
+                auto_anchor: String::new(),
+                custom_anchor: None,
+                line: 1,
+                text_lines: heading.heading.text_lines,
+                is_setext: heading.is_setext(),
+            }
+        };
+        let marked = "\u{feff}- # Title\n";
+        let plain = "- # Title\n";
+        let marked_prefix = heading_prefix_len(marked, MarkdownFlavor::Standard, &index(marked)).unwrap();
+        let plain_prefix = heading_prefix_len(plain, MarkdownFlavor::Standard, &index(plain)).unwrap();
+        assert_eq!(marked_prefix, plain_prefix + 3);
+    }
+
+    #[tokio::test]
+    async fn a_line_anchor_past_a_one_line_file_counts_one_line() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| RumdlLanguageServer::new(client, None));
+        let preview =
+            service
+                .inner()
+                .build_line_anchor_preview(Path::new("notes.txt"), &LineAnchor::Single(5), "only line\n");
+        assert!(preview.contains("past the end of the file (1 line)"), "{preview}");
+
+        let preview =
+            service
+                .inner()
+                .build_line_anchor_preview(Path::new("notes.txt"), &LineAnchor::Single(5), "one\ntwo\n");
+        assert!(preview.contains("past the end of the file (2 lines)"), "{preview}");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_file_only() {
+        let text = "See [link](guide.md) here.\n";
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_file_with_anchor() {
+        let text = "See [link](guide.md#install) here.\n";
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_same_file_anchor() {
+        let text = "See [below](#configuration) here.\n";
+        let position = Position { line: 0, character: 15 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "");
+        assert_eq!(link.anchor, "configuration");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_cursor_outside_link() {
+        let text = "Just some text here.\n";
+        let position = Position { line: 0, character: 5 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_full_link_target_cursor_at_start_of_target() {
+        let text = "See [link](guide.md) here.\n";
+        // Cursor right after `](`
+        let position = Position { line: 0, character: 11 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_cursor_at_end_of_target() {
+        let text = "See [link](guide.md) here.\n";
+        // Cursor right before `)`
+        let position = Position { line: 0, character: 19 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_in_code_span() {
+        let text = "See `[link](guide.md)` here.\n";
+        let position = Position { line: 0, character: 15 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_none(), "Should not detect links inside code spans");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_with_title() {
+        let text = r#"See [link](guide.md "Title") here."#;
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_with_single_quote_title() {
+        let text = "See [link](guide.md 'Title') here.";
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_with_paren_title() {
+        let text = "See [link](guide.md (Title)) here.";
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_with_title_and_anchor() {
+        let text = r#"See [link](guide.md#install "Install Guide") here."#;
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_angle_brackets() {
+        let text = "See [link](<guide.md>) here.";
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_angle_brackets_with_anchor() {
+        let text = "See [link](<guide.md#install>) here.";
+        let position = Position { line: 0, character: 14 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn test_strip_link_title_double_quotes() {
+        assert_eq!(strip_link_title(r#"file.md "Title""#), "file.md");
+    }
+
+    #[test]
+    fn test_strip_link_title_single_quotes() {
+        assert_eq!(strip_link_title("file.md 'Title'"), "file.md");
+    }
+
+    #[test]
+    fn test_strip_link_title_parens() {
+        assert_eq!(strip_link_title("file.md (Title)"), "file.md");
+    }
+
+    #[test]
+    fn test_strip_link_title_no_title() {
+        assert_eq!(strip_link_title("file.md"), "file.md");
+    }
+
+    #[test]
+    fn test_strip_link_title_with_spaces_in_path() {
+        // Space not followed by title delimiter should not strip
+        assert_eq!(strip_link_title("my file.md"), "my file.md");
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_basic() {
+        let content = "# Heading\n\nSee [below](#heading) for details.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].range.start.line, 2);
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_case_insensitive() {
+        let content = "See [link](#HEADING) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 1);
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_multiple() {
+        let content = "See [a](#heading) and [b](#heading) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 2);
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_no_match() {
+        let content = "See [link](#other) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 0);
+    }
+
+    // =========================================================================
+    // Balanced parentheses
+    // =========================================================================
+
+    #[test]
+    fn test_find_balanced_close_paren_simple() {
+        assert_eq!(find_balanced_close_paren("file.md)"), Some(7));
+    }
+
+    #[test]
+    fn test_find_balanced_close_paren_nested() {
+        // file(1).md)  — the inner `(1)` should not terminate the search
+        assert_eq!(find_balanced_close_paren("file(1).md)"), Some(10));
+    }
+
+    #[test]
+    fn test_find_balanced_close_paren_double_nested() {
+        assert_eq!(find_balanced_close_paren("a(b(c)).md)"), Some(10));
+    }
+
+    #[test]
+    fn test_find_balanced_close_paren_no_close() {
+        assert_eq!(find_balanced_close_paren("file.md"), None);
+    }
+
+    #[test]
+    fn test_detect_full_link_target_nested_parens() {
+        let text = "See [manpage](file(1).md) here.\n";
+        // Cursor on "file(1).md"
+        let position = Position { line: 0, character: 18 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some(), "Should handle balanced parens in link target");
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "file(1).md");
+        assert_eq!(link.anchor, "");
+    }
+
+    #[test]
+    fn test_detect_full_link_target_double_nested_parens() {
+        let text = "See [x](a(b(c)).md) here.\n";
+        let position = Position { line: 0, character: 12 };
+        let result = detect_full_link_target(text, position);
+        assert!(result.is_some(), "Should handle double-nested parens");
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "a(b(c)).md");
+    }
+
+    // =========================================================================
+    // URL vs file-path distinction
+    // =========================================================================
+
+    #[test]
+    fn test_is_external_url_https() {
+        assert!(is_external_url("https://example.com/page"));
+    }
+
+    #[test]
+    fn test_is_external_url_http() {
+        assert!(is_external_url("http://example.com/page"));
+    }
+
+    #[test]
+    fn test_is_external_url_mailto() {
+        assert!(is_external_url("mailto:user@example.com"));
+    }
+
+    #[test]
+    fn test_is_external_url_www() {
+        assert!(is_external_url("www.example.com"));
+    }
+
+    #[test]
+    fn test_is_external_url_relative_path() {
+        assert!(!is_external_url("guide.md"));
+    }
+
+    #[test]
+    fn test_is_external_url_empty() {
+        assert!(!is_external_url(""));
+    }
+
+    #[test]
+    fn test_is_external_url_fragment_only() {
+        assert!(!is_external_url("#heading"));
+    }
+
+    // =========================================================================
+    // Code block / code span filtering in find_same_file_fragment_links
+    // =========================================================================
+
+    #[test]
+    fn test_find_same_file_fragment_links_skips_code_blocks() {
+        let content = "# Heading\n\n```\nSee [link](#heading) in code.\n```\n\nReal [link](#heading) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 1, "Should only find the link outside the code block");
+        assert_eq!(
+            locations[0].range.start.line, 6,
+            "Should be on the line after the code block"
+        );
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_skips_code_spans() {
+        let content = "See `[link](#heading)` and [real](#heading) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 1, "Should only find the link outside the code span");
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_includes_reference_links() {
+        let content = "See [text][ref] and [inline](#heading) here.\n\n[ref]: #heading\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(
+            locations.len(),
+            2,
+            "Should find both inline and reference-style fragment links"
+        );
+    }
+
+    #[test]
+    fn test_find_same_file_fragment_links_utf16_position() {
+        // Emoji before the link: "🎉 " is 4 bytes / 2 UTF-16 code units + 1 space
+        let content = "🎉 [link](#heading) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let locations = find_same_file_fragment_links(content, &uri, "heading");
+        assert_eq!(locations.len(), 1);
+        // '🎉' is 2 UTF-16 code units + ' ' is 1 = character 3
+        assert_eq!(
+            locations[0].range.start.character, 3,
+            "Character position should be in UTF-16 code units, not bytes"
+        );
+    }
+
+    // =========================================================================
+    // Reference-style link detection
+    // =========================================================================
+
+    #[test]
+    fn test_detect_ref_definition_basic() {
+        let result = detect_ref_definition("[guide]: guide.md", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "");
+    }
+
+    #[test]
+    fn test_detect_ref_definition_with_anchor() {
+        let result = detect_ref_definition("[guide]: guide.md#install", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn test_detect_ref_definition_indented() {
+        let result = detect_ref_definition("   [guide]: guide.md", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_detect_ref_definition_not_a_definition() {
+        let result = detect_ref_definition("Some [text] here", MarkdownFlavor::default());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_basic() {
+        let text = "See [guide] for info.\n\n[guide]: guide.md\n";
+        let result = resolve_reference_to_target(text, "guide", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_case_insensitive() {
+        let text = "See [Guide] here.\n\n[guide]: guide.md\n";
+        let result = resolve_reference_to_target(text, "guide", MarkdownFlavor::default());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_with_anchor() {
+        let text = "[ref]: guide.md#install\n";
+        let result = resolve_reference_to_target(text, "ref", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn reference_resolution_uses_the_document_parser_corpus() {
+        let cases = [
+            ("[id]: <docs/has space.md#part>\n", "docs/has space.md", "part"),
+            ("> [id]: quoted.md#section\n", "quoted.md", "section"),
+            ("[id]: docs/a\\(1\\).md\n", "docs/a(1).md", ""),
+            ("[id]: guide.md\n  \"A title on the next line\"\n", "guide.md", ""),
+        ];
+
+        for (content, expected_path, expected_anchor) in cases {
+            let target = resolve_reference_to_target(content, "ID", MarkdownFlavor::default())
+                .unwrap_or_else(|| panic!("reference did not resolve: {content:?}"));
+            assert_eq!(target.file_path, expected_path, "input: {content:?}");
+            assert_eq!(target.anchor, expected_anchor, "input: {content:?}");
+        }
+
+        assert!(resolve_reference_to_target("[^id]: note\n", "id", MarkdownFlavor::default()).is_none());
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_not_found() {
+        let text = "No definitions here.\n";
+        let result = resolve_reference_to_target(text, "guide", MarkdownFlavor::default());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_skips_code_block() {
+        let text = "See [guide] here.\n\n```\n[guide]: wrong.md\n```\n\n[guide]: correct.md\n";
+        let result = resolve_reference_to_target(text, "guide", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "correct.md", "Should skip definition inside code block");
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_only_in_code_block() {
+        let text = "See [guide] here.\n\n```\n[guide]: guide.md\n```\n";
+        let result = resolve_reference_to_target(text, "guide", MarkdownFlavor::default());
+        assert!(result.is_none(), "Should not find definition inside code block");
+    }
+
+    #[test]
+    fn test_resolve_reference_to_target_skips_indented_code_block() {
+        let text = "See [guide] here.\n\n    [guide]: wrong.md\n\n[guide]: correct.md\n";
+        let result = resolve_reference_to_target(text, "guide", MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(
+            link.file_path, "correct.md",
+            "Should skip definition inside indented code block"
+        );
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_full_reference() {
+        // [text][ref-id]  — cursor on "text"
+        let line = "See [guide text][guide] here.";
+        let result = detect_ref_link_usage(line, 8);
+        assert_eq!(result.as_deref(), Some("guide"));
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_collapsed_reference() {
+        // [text][]  — cursor on "text"
+        let line = "See [guide][] here.";
+        let result = detect_ref_link_usage(line, 7);
+        assert_eq!(result.as_deref(), Some("guide"));
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_shortcut_reference() {
+        // [text]  — cursor on "text"
+        let line = "See [guide] here.";
+        let result = detect_ref_link_usage(line, 7);
+        assert_eq!(result.as_deref(), Some("guide"));
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_cursor_in_second_bracket() {
+        // [text][ref-id]  — cursor on "ref-id" (second bracket pair)
+        let line = "See [text][guide] here.";
+        // Cursor at 'g' in "guide" (index 11)
+        let result = detect_ref_link_usage(line, 11);
+        assert_eq!(result.as_deref(), Some("guide"));
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_cursor_in_empty_second_bracket() {
+        // [text][]  — cursor in the empty second bracket
+        let line = "See [guide][] here.";
+        // Cursor at index 12 (between the empty [])
+        let result = detect_ref_link_usage(line, 12);
+        assert_eq!(result.as_deref(), Some("guide"));
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_not_inline_link() {
+        // Should not match `[text](url)` — that's an inline link, not a reference
+        let line = "See [link](guide.md) here.";
+        let result = detect_ref_link_usage(line, 7);
+        assert!(result.is_none(), "Should not match inline links");
+    }
+
+    #[test]
+    fn test_detect_ref_link_usage_in_code_span() {
+        let line = "See `[guide]` here.";
+        let result = detect_ref_link_usage(line, 8);
+        assert!(result.is_none(), "Should not match inside code spans");
+    }
+
+    #[test]
+    fn test_detect_ref_link_target_full_reference() {
+        let text = "See [click here][guide] for info.\n\n[guide]: guide.md#install\n";
+        // Cursor on "click here"
+        let position = Position { line: 0, character: 8 };
+        let result = detect_ref_link_target(text, position, MarkdownFlavor::default());
+        assert!(result.is_some(), "Should resolve full reference link");
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn test_detect_ref_link_target_collapsed_reference() {
+        let text = "See [guide][] for info.\n\n[guide]: guide.md\n";
+        let position = Position { line: 0, character: 7 };
+        let result = detect_ref_link_target(text, position, MarkdownFlavor::default());
+        assert!(result.is_some(), "Should resolve collapsed reference link");
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+    }
+
+    #[test]
+    fn test_detect_ref_link_target_definition_line() {
+        let text = "[guide]: guide.md#install\n";
+        // Cursor on the definition line
+        let position = Position { line: 0, character: 5 };
+        let result = detect_ref_link_target(text, position, MarkdownFlavor::default());
+        assert!(result.is_some(), "Should resolve reference definition line");
+        let link = result.unwrap();
+        assert_eq!(link.file_path, "guide.md");
+        assert_eq!(link.anchor, "install");
+    }
+
+    #[test]
+    fn test_detect_ref_link_target_external_url() {
+        let text = "See [example] for info.\n\n[example]: https://example.com\n";
+        let position = Position { line: 0, character: 7 };
+        let result = detect_ref_link_target(text, position, MarkdownFlavor::default());
+        assert!(result.is_some());
+        let link = result.unwrap();
+        // The target is an external URL — is_external_url should catch this at the handler level
+        assert!(is_external_url(&link.file_path));
+    }
+
+    // =========================================================================
+    // Heading text range helpers (for rename)
+    // =========================================================================
+
+    #[test]
+    fn test_find_heading_text_start_atx() {
+        assert_eq!(find_heading_text_start("# Heading"), Some(2));
+        assert_eq!(find_heading_text_start("## Heading"), Some(3));
+        assert_eq!(find_heading_text_start("### Heading"), Some(4));
+    }
+
+    #[test]
+    fn test_find_heading_text_start_no_space() {
+        // Invalid ATX heading (no space after #)
+        assert_eq!(find_heading_text_start("#NoSpace"), None);
+    }
+
+    #[test]
+    fn test_find_heading_text_start_not_heading() {
+        assert_eq!(find_heading_text_start("Just text"), None);
+        assert_eq!(find_heading_text_start(""), None);
+    }
+
+    #[test]
+    fn test_find_heading_text_start_leading_whitespace() {
+        assert_eq!(find_heading_text_start("  ## Heading"), Some(5));
+    }
+
+    #[test]
+    fn test_find_heading_text_start_empty_heading() {
+        assert_eq!(find_heading_text_start("##"), Some(2));
+    }
+
+    #[test]
+    fn test_find_heading_text_end_simple() {
+        let line = "## Hello World";
+        let start = find_heading_text_start(line).unwrap();
+        let end = find_heading_text_end(line, start);
+        assert_eq!(&line[start..end], "Hello World");
+    }
+
+    #[test]
+    fn test_find_heading_text_end_with_custom_anchor() {
+        let line = "## Guide {#install}";
+        let start = find_heading_text_start(line).unwrap();
+        let end = find_heading_text_end(line, start);
+        assert_eq!(&line[start..end], "Guide");
+    }
+
+    #[test]
+    fn test_find_heading_text_end_with_closing_atx() {
+        let line = "## Hello ##";
+        let start = find_heading_text_start(line).unwrap();
+        let end = find_heading_text_end(line, start);
+        assert_eq!(&line[start..end], "Hello");
+    }
+
+    #[test]
+    fn test_find_heading_text_end_with_trailing_spaces() {
+        let line = "## Hello   ";
+        let start = find_heading_text_start(line).unwrap();
+        let end = find_heading_text_end(line, start);
+        assert_eq!(&line[start..end], "Hello");
+    }
+
+    #[test]
+    fn test_find_heading_text_end_unicode() {
+        let line = "## 日本語";
+        let start = find_heading_text_start(line).unwrap();
+        let end = find_heading_text_end(line, start);
+        assert_eq!(&line[start..end], "日本語");
+    }
+
+    #[test]
+    fn test_find_heading_text_end_unicode_with_closing() {
+        let line = "## 日本語 ##";
+        let start = find_heading_text_start(line).unwrap();
+        let end = find_heading_text_end(line, start);
+        assert_eq!(&line[start..end], "日本語");
+    }
+
+    // =========================================================================
+    // Anchor edit in link helpers (for rename)
+    // =========================================================================
+
+    #[test]
+    fn test_find_all_anchor_edits_in_link_inline() {
+        let line = "See [link](guide.md#getting-started) here.";
+        let edits = find_all_anchor_edits_in_link(line, 0, "getting-started", "quick-start");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "quick-start");
+        let start = edits[0].range.start.character as usize;
+        let end = edits[0].range.end.character as usize;
+        assert_eq!(&line[start..end], "getting-started");
+    }
+
+    #[test]
+    fn test_find_all_anchor_edits_in_link_ignores_display_text() {
+        // The `#getting-started` appears in the display text too
+        let line = "See [#getting-started info](guide.md#getting-started) here.";
+        let edits = find_all_anchor_edits_in_link(line, 0, "getting-started", "quick-start");
+        assert_eq!(edits.len(), 1);
+        // Should match the URL portion, not the display text
+        let start = edits[0].range.start.character as usize;
+        let end = edits[0].range.end.character as usize;
+        assert_eq!(&line[start..end], "getting-started");
+        assert!(start > 30, "Should match in the URL, not the display text");
+    }
+
+    #[test]
+    fn test_find_all_anchor_edits_in_link_ref_definition() {
+        let line = "[guide]: guide.md#getting-started";
+        let edits = find_all_anchor_edits_in_link(line, 5, "getting-started", "quick-start");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "quick-start");
+        assert_eq!(edits[0].range.start.line, 5);
+    }
+
+    #[test]
+    fn test_find_all_anchor_edits_in_link_no_match() {
+        let line = "See [link](guide.md#other-section) here.";
+        let edits = find_all_anchor_edits_in_link(line, 0, "getting-started", "quick-start");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_find_all_anchor_edits_in_link_multiple_on_same_line() {
+        let line = "See [a](guide.md#heading) and [b](guide.md#heading) here.";
+        let edits = find_all_anchor_edits_in_link(line, 0, "heading", "new-heading");
+        assert_eq!(edits.len(), 2, "Should find both anchors on the same line");
+        // Edits should target different positions
+        assert_ne!(edits[0].range.start.character, edits[1].range.start.character,);
+    }
+
+    // =========================================================================
+    // Same-file anchor edits (for rename)
+    // =========================================================================
+
+    #[test]
+    fn test_collect_same_file_anchor_edits_inline() {
+        let content = "# Getting Started\n\nSee [below](#getting-started) for details.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        collect_same_file_anchor_edits(&uri, content, "getting-started", "quick-start", &mut changes);
+
+        let edits = changes.get(&uri).expect("Should have edits for the URI");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "quick-start");
+    }
+
+    #[test]
+    fn test_collect_same_file_anchor_edits_multiple() {
+        let content = "# Heading\n\n[a](#heading) and [b](#heading).\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        collect_same_file_anchor_edits(&uri, content, "heading", "new-heading", &mut changes);
+
+        let edits = changes.get(&uri).expect("Should have edits");
+        assert_eq!(edits.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_same_file_anchor_edits_no_match() {
+        let content = "# Heading\n\n[a](#other) here.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        collect_same_file_anchor_edits(&uri, content, "heading", "new-heading", &mut changes);
+
+        assert!(changes.is_empty());
+    }
+
+    // =========================================================================
+    // Same-file reference definition edits (for rename)
+    // =========================================================================
+
+    #[test]
+    fn test_collect_same_file_ref_def_edits_basic() {
+        let content = "# Heading\n\n[ref]: #heading\n\nSee [ref] for info.\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        collect_same_file_ref_def_edits(&uri, content, "heading", "new-heading", &mut changes);
+
+        let edits = changes.get(&uri).expect("Should have edits");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "new-heading");
+    }
+
+    #[test]
+    fn test_collect_same_file_ref_def_edits_no_match() {
+        let content = "[ref]: #other\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        collect_same_file_ref_def_edits(&uri, content, "heading", "new-heading", &mut changes);
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn test_collect_same_file_ref_def_edits_not_fragment_only() {
+        // Reference definitions pointing to files shouldn't be caught here
+        let content = "[ref]: guide.md#heading\n";
+        let uri = Url::parse("file:///test.md").unwrap();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        collect_same_file_ref_def_edits(&uri, content, "heading", "new-heading", &mut changes);
+
+        // This targets same-file fragment-only defs, so file.md#heading is not matched
+        assert!(changes.is_empty());
+    }
+
+    // =========================================================================
+    // find_fragment_in_link_source (for rename)
+    // =========================================================================
+
+    #[test]
+    fn test_find_fragment_in_link_source_inline() {
+        let source = "[text](#getting-started)";
+        let pos = find_fragment_in_link_source(source, "getting-started");
+        assert!(pos.is_some());
+        let pos = pos.unwrap();
+        assert_eq!(&source[pos..pos + "getting-started".len()], "getting-started");
+    }
+
+    #[test]
+    fn test_find_fragment_in_link_source_with_hash_in_text() {
+        // Display text contains #, but anchor is in URL
+        let source = "[C# Guide](#c-guide)";
+        let pos = find_fragment_in_link_source(source, "c-guide");
+        assert!(pos.is_some());
+        let pos = pos.unwrap();
+        assert_eq!(&source[pos..pos + "c-guide".len()], "c-guide");
+    }
+}

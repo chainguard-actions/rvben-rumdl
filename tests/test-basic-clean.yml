@@ -1,0 +1,28 @@
+name: Test basic check on clean markdown
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean markdown
+        run: |
+          mkdir -p "$RUNNER_TEMP/md-clean"
+          printf '# Title\n\nSome text.\n' > "$RUNNER_TEMP/md-clean/clean.md"
+      - id: action
+        uses: .
+        with:
+          path: ${{ runner.temp }}/md-clean/clean.md
+          config: tests/fixtures/rumdl-test.toml
+      - name: Assert outputs
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+          RPATH: ${{ steps.action.outputs.rumdl-path }}
+        run: |
+          echo "version: $VERSION"
+          echo "path: $RPATH"
+          if [ -z "$VERSION" ]; then echo "FAIL: empty version"; exit 1; fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then echo "FAIL: version not semver-like"; exit 1; fi
+          if [ -z "$RPATH" ] || [ ! -x "$RPATH" ]; then echo "FAIL: rumdl-path not executable"; exit 1; fi
+          echo "PASS"

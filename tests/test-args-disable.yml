@@ -1,0 +1,25 @@
+name: Test extra args disable rule
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create markdown with trailing whitespace
+        run: |
+          mkdir -p "$RUNNER_TEMP/md-args"
+          printf '# Title\n\nSome text with trailing space. \n' > "$RUNNER_TEMP/md-args/bad.md"
+      - id: action
+        uses: .
+        with:
+          path: ${{ runner.temp }}/md-args/bad.md
+          config: tests/fixtures/rumdl-test.toml
+          args: --disable MD009
+      - name: Assert success
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then echo "FAIL"; exit 1; fi
+          echo "PASS"

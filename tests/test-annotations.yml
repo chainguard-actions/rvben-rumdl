@@ -1,0 +1,27 @@
+name: Test annotations report type
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create markdown with trailing whitespace
+        run: |
+          mkdir -p "$RUNNER_TEMP/md-ann"
+          printf '# Title\n\nSome text with trailing space. \n' > "$RUNNER_TEMP/md-ann/bad.md"
+      - id: action
+        uses: .
+        with:
+          path: ${{ runner.temp }}/md-ann/bad.md
+          config: tests/fixtures/rumdl-test.toml
+          report-type: annotations
+          fail-on-error: "false"
+          output-file: ${{ runner.temp }}/ann.txt
+      - name: Assert github annotation format
+        run: |
+          f="$RUNNER_TEMP/ann.txt"
+          cat "$f"
+          if ! grep -qE '^::(warning|error)' "$f"; then echo "FAIL: expected ::warning/::error annotations"; exit 1; fi
+          if ! grep -q "MD009" "$f"; then echo "FAIL: expected MD009"; exit 1; fi
+          echo "PASS"
