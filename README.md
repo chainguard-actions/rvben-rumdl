@@ -14,6 +14,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | v0.3.0 | [`v0.3.0`](https://github.com/chainguard-actions/rvben-rumdl/tree/v0.3.0) | [`1900689`](https://github.com/rvben/rumdl/commit/19006897519812a2fdc508314b34738e5c281233) | [`HARDENING.md`](https://github.com/chainguard-actions/rvben-rumdl/blob/v0.3.0/HARDENING.md) |
 | v0.3.1 | [`v0.3.1`](https://github.com/chainguard-actions/rvben-rumdl/tree/v0.3.1) | [`9b8161e`](https://github.com/rvben/rumdl/commit/9b8161e6124f1bde9d5c3dd0c9a36ceb559e1f53) | [`HARDENING.md`](https://github.com/chainguard-actions/rvben-rumdl/blob/v0.3.1/HARDENING.md) |
 | v0.3.2 | [`v0.3.2`](https://github.com/chainguard-actions/rvben-rumdl/tree/v0.3.2) | [`1e0f1d1`](https://github.com/rvben/rumdl/commit/1e0f1d13c87418c31e0d59dacddd98f27a02efcc) | [`HARDENING.md`](https://github.com/chainguard-actions/rvben-rumdl/blob/v0.3.2/HARDENING.md) |
+| v0.3.3 | [`v0.3.3`](https://github.com/chainguard-actions/rvben-rumdl/tree/v0.3.3) | [`dac508e`](https://github.com/rvben/rumdl/commit/dac508e6b2f52c1d869811d138ffc1ff2b9f6e71) | [`HARDENING.md`](https://github.com/chainguard-actions/rvben-rumdl/blob/v0.3.3/HARDENING.md) |
 
 ## Privacy
 
