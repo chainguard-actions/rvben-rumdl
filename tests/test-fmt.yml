@@ -1,0 +1,36 @@
+name: Test fmt rewrites files in place
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare work copy
+        run: |
+          mkdir -p fmt-work
+          cp tests/fixtures/dirty.md fmt-work/dirty.md
+      - id: action
+        uses: .
+        with:
+          command: fmt
+          path: fmt-work/dirty.md
+          config: tests/fixtures/rumdl.toml
+          fail-on-error: "false"
+      - name: Assert file was rewritten
+        run: |
+          echo "--- after ---"
+          cat -A fmt-work/dirty.md
+          if cmp -s tests/fixtures/dirty.md fmt-work/dirty.md; then
+            echo "FAIL: file was not modified by fmt"
+            exit 1
+          fi
+          if ! grep -q '^# Bad Heading' fmt-work/dirty.md; then
+            echo "FAIL: expected heading to be fixed to '# Bad Heading'"
+            exit 1
+          fi
+          if grep -q ' $' fmt-work/dirty.md; then
+            echo "FAIL: trailing whitespace remains"
+            exit 1
+          fi
+          echo "PASS"

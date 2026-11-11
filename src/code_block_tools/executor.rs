@@ -1,0 +1,1027 @@
+//! Tool execution engine for running external formatters and linters.
+//!
+//! This module handles the actual execution of external tools via stdin/stdout,
+//! with timeout support and lazy tool availability checking.
+
+use super::config::ToolDefinition;
+use super::wait;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
+
+/// Ignores `SIGPIPE` process-wide for as long as any instance is alive.
+///
+/// rumdl restores the default disposition of `SIGPIPE` at startup so that piping its
+/// own output into `head` ends the run quietly. Writing to a tool that has already
+/// exited raises the same signal, which kills rumdl mid-run instead of producing the
+/// `BrokenPipe` error the stdin write is written to tolerate.
+///
+/// The disposition has to be changed for the whole process, not masked for the writing
+/// thread: macOS raises a pipe-write `SIGPIPE` against the process rather than against
+/// the thread that wrote, so a thread mask only moves the death to whichever other
+/// thread does not block it (observed landing in a pipe-reader thread). Ignoring it
+/// discards the signal where it is raised.
+///
+/// The window is the write alone, and concurrent tool executions are counted so that
+/// the first to finish does not restore the disposition while another is still writing.
+#[cfg(unix)]
+struct SigpipeIgnored;
+
+#[cfg(unix)]
+static SIGPIPE_IGNORED: Mutex<(usize, libc::sighandler_t)> = Mutex::new((0, 0));
+
+#[cfg(unix)]
+impl SigpipeIgnored {
+    fn new() -> Self {
+        let mut state = SIGPIPE_IGNORED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.0 == 0 {
+            // SAFETY: `signal` with `SIG_IGN` is async-signal-safe and the previous
+            // disposition is restored in `Drop`.
+            state.1 = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        }
+        state.0 += 1;
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SigpipeIgnored {
+    fn drop(&mut self) {
+        let mut state = SIGPIPE_IGNORED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 -= 1;
+        if state.0 == 0 {
+            // SAFETY: as in `new`. Restores whatever disposition was in place, which is
+            // the default for the CLI and `SIG_IGN` for a library caller.
+            unsafe {
+                libc::signal(libc::SIGPIPE, state.1);
+            }
+        }
+    }
+}
+
+/// `bun fmt` prefers a package.json script over the built-in formatter.
+/// Reject that ambiguity before spawning a code-block formatter: script output
+/// is not formatted code, and the script may write unrelated project files.
+fn check_bun_fmt_scripts(start: &std::path::Path) -> Result<(), String> {
+    for directory in start.ancestors() {
+        // Bun also dispatches local entry points and package-installed binaries.
+        // Check the ancestor locations conservatively so invoking from a docs
+        // subdirectory cannot bypass a collision at the package root.
+        let mut entries = vec![directory.join("fmt"), directory.join("fmt/package.json")];
+        for extension in ["tsx", "ts", "jsx", "cts", "cjs", "js", "mjs", "mts"] {
+            entries.push(directory.join(format!("fmt.{extension}")));
+            entries.push(directory.join(format!("fmt/index.{extension}")));
+        }
+        for suffix in ["", ".bunx", ".exe", ".cmd"] {
+            entries.push(directory.join(format!("node_modules/.bin/fmt{suffix}")));
+        }
+        if let Some(entry) = entries.into_iter().find(|entry| entry.is_file()) {
+            return Err(format!(
+                "bun fmt would run a project entry point at {} instead of the built-in formatter; rename that entry point before using bun-fmt",
+                entry.display()
+            ));
+        }
+        let manifest = directory.join("package.json");
+        let source = match std::fs::read_to_string(&manifest) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect {} before running bun fmt: {error}",
+                    manifest.display()
+                ));
+            }
+        };
+        let package: serde_json::Value = serde_json::from_str(&source)
+            .map_err(|error| format!("Cannot inspect {} before running bun fmt: {error}", manifest.display()))?;
+        if package.get("scripts").and_then(|scripts| scripts.get("fmt")).is_some() {
+            return Err(format!(
+                "bun fmt would run the package.json fmt script in {} instead of the built-in formatter; rename that script before using bun-fmt",
+                manifest.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Timeouts of one tool that end further attempts at it.
+///
+/// A tool that hangs does so for every block it is handed, and each attempt costs the
+/// whole timeout. Three is enough to tell a hanging tool from one that is merely slow on
+/// an occasional large block.
+const TIMEOUT_LIMIT: u32 = 3;
+
+/// Timeout tallies keyed by tool name, shared by every executor in the process.
+///
+/// The tally has to outlive one executor: a fresh executor is built per file, so
+/// per-instance state would forget what the previous file just learned and every file
+/// would pay the timeout over again. A tool that exits on its own clears its own tally,
+/// so a single slow block never disables anything.
+static TIMEOUT_COUNTS: LazyLock<Arc<Mutex<HashMap<String, u32>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Version probes are shared across files, which each construct an executor.
+// Resolve the binary and include its identity so PATH changes and replacements
+// do not inherit an answer for a different installation.
+type CheckCapabilityKey = (String, PathBuf, Option<SystemTime>, u64);
+static CHECK_CAPABILITIES: LazyLock<Mutex<HashMap<CheckCapabilityKey, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A native check verdict or formatted content for exact comparison.
+pub(crate) enum FormatCheckOutput {
+    Native { changed: bool },
+    Formatted(String),
+}
+
+/// Result of executing a tool.
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    /// Standard output from the tool.
+    pub stdout: String,
+    /// Standard error from the tool.
+    pub stderr: String,
+    /// Exit code (0 typically means success).
+    pub exit_code: i32,
+    /// Whether the tool executed successfully (exit code 0).
+    pub success: bool,
+}
+
+/// Error during tool execution.
+#[derive(Debug, Clone)]
+pub enum ExecutorError {
+    /// Tool binary not found in allowed lookup locations.
+    ToolNotFound { tool: String },
+    /// Tool execution failed.
+    ExecutionFailed { tool: String, message: String },
+    /// Tool execution timed out.
+    Timeout { tool: String, timeout_ms: u64 },
+    /// Tool skipped without being run, having already timed out repeatedly.
+    RepeatedTimeouts {
+        tool: String,
+        timeout_ms: u64,
+        timeouts: u32,
+    },
+    /// I/O error during execution.
+    IoError { message: String },
+}
+
+impl std::fmt::Display for ExecutorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ToolNotFound { tool } => {
+                write!(f, "Tool '{tool}' not found in allowed lookup locations")
+            }
+            Self::ExecutionFailed { tool, message } => {
+                write!(f, "Tool '{tool}' failed: {message}")
+            }
+            Self::Timeout { tool, timeout_ms } => {
+                write!(f, "Tool '{tool}' timed out after {timeout_ms}ms")
+            }
+            Self::RepeatedTimeouts {
+                tool,
+                timeout_ms,
+                timeouts,
+            } => {
+                write!(
+                    f,
+                    "Tool '{tool}' skipped after timing out {timeouts} times at {timeout_ms}ms; a tool that never exits is usually not reading its stdin"
+                )
+            }
+            Self::IoError { message } => {
+                write!(f, "I/O error: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
+
+/// Executor for running external tools.
+///
+/// Caches tool availability checks for efficiency.
+pub struct ToolExecutor {
+    /// Cache of tool availability checks (tool name -> available).
+    tool_cache: Arc<Mutex<HashMap<String, bool>>>,
+    /// Timeouts recorded per tool since it last exited on its own.
+    timeout_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Default timeout in milliseconds.
+    default_timeout_ms: u64,
+    binary_preferences: std::collections::BTreeMap<String, super::config::BinaryPreference>,
+    project_root: std::path::PathBuf,
+    run_state: Option<Arc<super::run_state::RunState>>,
+}
+
+impl ToolExecutor {
+    /// Create a new executor with the given default timeout.
+    ///
+    /// Timeouts are tallied process-wide, so a tool that hangs is attempted a bounded
+    /// number of times across every file of a run rather than once per file.
+    pub fn new(default_timeout_ms: u64) -> Self {
+        Self {
+            tool_cache: Arc::new(Mutex::new(HashMap::new())),
+            timeout_counts: Arc::clone(&TIMEOUT_COUNTS),
+            default_timeout_ms,
+            binary_preferences: std::collections::BTreeMap::new(),
+            project_root: std::env::current_dir().unwrap_or_default(),
+            run_state: None,
+        }
+    }
+
+    /// Create an executor that tallies timeouts only for itself.
+    ///
+    /// For callers that must not inherit or contribute to the process-wide tally, such
+    /// as tests, where one test's hanging tool would otherwise decide whether another
+    /// test's tool is run at all.
+    pub fn isolated(default_timeout_ms: u64) -> Self {
+        Self {
+            tool_cache: Arc::new(Mutex::new(HashMap::new())),
+            timeout_counts: Arc::new(Mutex::new(HashMap::new())),
+            default_timeout_ms,
+            binary_preferences: std::collections::BTreeMap::new(),
+            project_root: std::env::current_dir().unwrap_or_default(),
+            run_state: None,
+        }
+    }
+
+    /// Use the document's project for installed-binary discovery.
+    pub fn with_binary_resolution(
+        mut self,
+        preferences: std::collections::BTreeMap<String, super::config::BinaryPreference>,
+        root: std::path::PathBuf,
+    ) -> Self {
+        self.binary_preferences = preferences;
+        self.project_root = root;
+        self.tool_cache.lock().unwrap().clear();
+        self
+    }
+
+    pub fn with_run_state(mut self, state: Arc<super::run_state::RunState>) -> Self {
+        self.run_state = Some(state);
+        self
+    }
+
+    pub fn resolve_binary(&self, binary: &str) -> Option<std::path::PathBuf> {
+        super::binary::resolve(
+            binary,
+            &self.binary_preferences,
+            &self.project_root,
+            std::env::var_os("PATH").as_deref(),
+        )
+    }
+
+    pub(crate) fn project_root(&self) -> &std::path::Path {
+        &self.project_root
+    }
+
+    /// Timeouts recorded for a tool since it last exited on its own.
+    fn timeout_key(&self, tool_name: &str) -> String {
+        self.resolve_binary(tool_name).map_or_else(
+            || tool_name.into(),
+            |path| {
+                std::fs::canonicalize(&path)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
+            },
+        )
+    }
+
+    fn timeout_count(&self, tool_name: &str) -> u32 {
+        self.timeout_counts
+            .lock()
+            .unwrap()
+            .get(&self.timeout_key(tool_name))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record that a tool had to be killed at its timeout.
+    fn record_timeout(&self, tool_name: &str) {
+        *self
+            .timeout_counts
+            .lock()
+            .unwrap()
+            .entry(self.timeout_key(tool_name))
+            .or_insert(0) += 1;
+    }
+
+    /// Forget a tool's timeouts, after it exited without needing to be killed.
+    fn clear_timeouts(&self, tool_name: &str) {
+        self.timeout_counts.lock().unwrap().remove(&self.timeout_key(tool_name));
+    }
+
+    /// Check if a tool is available (lazy, cached).
+    pub fn is_tool_available(&self, tool_name: &str) -> bool {
+        // Check cache first
+        {
+            let cache = self.tool_cache.lock().unwrap();
+            if let Some(&available) = cache.get(tool_name) {
+                return available;
+            }
+        }
+
+        // Resolved in-process the way the spawn itself would resolve it, so the
+        // answer does not depend on a `which`/`where` binary being installed.
+        let available = self.check_tool_exists(tool_name);
+
+        // Cache the result
+        {
+            let mut cache = self.tool_cache.lock().unwrap();
+            cache.insert(tool_name.to_string(), available);
+        }
+
+        available
+    }
+
+    /// Check if a tool binary exists where `Command::new` would look for it.
+    fn check_tool_exists(&self, tool_name: &str) -> bool {
+        self.resolve_binary(tool_name).is_some()
+    }
+
+    /// Execute a tool with the given input.
+    ///
+    /// # Arguments
+    /// * `tool_def` - Tool definition with command and arguments
+    /// * `input` - Content to pass via stdin
+    /// * `is_format_mode` - Whether to use format_args (true) or lint_args (false)
+    /// * `timeout_ms` - Optional timeout override
+    ///
+    /// # Returns
+    /// Tool output on success, or an error.
+    pub fn execute(
+        &self,
+        tool_def: &ToolDefinition,
+        input: &str,
+        is_format_mode: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<ToolOutput, ExecutorError> {
+        if tool_def.command.is_empty() {
+            return Err(ExecutorError::ExecutionFailed {
+                tool: "unknown".to_string(),
+                message: "Empty command".to_string(),
+            });
+        }
+
+        let tool_name = &tool_def.command[0];
+
+        if tool_name == "bun" && tool_def.command.get(1).is_some_and(|arg| arg == "fmt") {
+            let cwd = std::env::current_dir().map_err(|error| ExecutorError::IoError {
+                message: error.to_string(),
+            })?;
+            check_bun_fmt_scripts(&cwd).map_err(|message| ExecutorError::ExecutionFailed {
+                tool: tool_name.clone(),
+                message,
+            })?;
+        }
+
+        // Check tool availability (lazy, cached)
+        if !self.is_tool_available(tool_name) {
+            return Err(ExecutorError::ToolNotFound {
+                tool: tool_name.clone(),
+            });
+        }
+
+        // A tool that has hung this many times will hang again, and every further
+        // attempt costs the full timeout. Report it per block, but stop paying for it.
+        // Files are processed in parallel, so attempts already in flight when the limit
+        // is reached still run: the ceiling is the limit plus the worker count, which is
+        // a constant, rather than one timeout per code block in the run.
+        let effective_timeout_ms = timeout_ms.unwrap_or(self.default_timeout_ms);
+        let timeouts = self.timeout_count(tool_name);
+        if timeouts >= TIMEOUT_LIMIT {
+            return Err(ExecutorError::RepeatedTimeouts {
+                tool: tool_name.clone(),
+                timeout_ms: effective_timeout_ms,
+                timeouts,
+            });
+        }
+
+        // Build command
+        let resolved_binary = self
+            .resolve_binary(tool_name)
+            .ok_or_else(|| ExecutorError::ToolNotFound {
+                tool: tool_name.clone(),
+            })?;
+        let mut cmd = Command::new(resolved_binary);
+
+        // Add base arguments
+        if tool_def.command.len() > 1 {
+            cmd.args(&tool_def.command[1..]);
+        }
+
+        // Add mode-specific arguments
+        let extra_args = if is_format_mode {
+            &tool_def.format_args
+        } else {
+            &tool_def.lint_args
+        };
+        if !extra_args.is_empty() {
+            cmd.args(extra_args);
+        }
+
+        // Configure stdin/stdout
+        if tool_def.stdin {
+            cmd.stdin(Stdio::piped());
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        // Spawn process
+        let mut child = cmd.spawn().map_err(|e| ExecutorError::IoError {
+            message: format!("Failed to spawn '{tool_name}': {e}"),
+        })?;
+
+        if let Some(state) = &self.run_state {
+            state.record_execution();
+        }
+
+        let mut stdout_handle = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_pipe_to_string(stdout, true)));
+        let mut stderr_handle = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_pipe_to_string(stderr, false)));
+
+        // Write stdin if required.
+        // BrokenPipe is ignored: the tool may exit before consuming all input
+        // (e.g., `true` or a linter that validates without reading fully). On Unix that
+        // write raises SIGPIPE, so the signal is blocked for the duration or the error
+        // below is never reached.
+        if tool_def.stdin
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            #[cfg(unix)]
+            let _sigpipe = SigpipeIgnored::new();
+
+            if let Err(e) = stdin.write_all(input.as_bytes())
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(ExecutorError::IoError {
+                    message: format!("Failed to write to stdin: {e}"),
+                });
+            }
+        }
+
+        // Wait for completion with timeout
+        let timeout = Duration::from_millis(effective_timeout_ms);
+        let status = if timeout.is_zero() {
+            child.wait().map_err(|e| ExecutorError::IoError {
+                message: format!("Failed to wait for '{tool_name}': {e}"),
+            })?
+        } else {
+            let waited = wait::wait_timeout(&mut child, timeout).map_err(|e| ExecutorError::IoError {
+                message: format!("Failed to wait for '{tool_name}': {e}"),
+            })?;
+            match waited {
+                Some(status) => status,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // The reader threads are deliberately abandoned rather than joined.
+                    // `read_to_end` returns only once every write end of the pipe is
+                    // closed, and a killed tool can leave a descendant holding one, so
+                    // joining here waits on exactly the process the timeout exists to
+                    // bound. Each thread ends by itself once the pipe finally closes.
+                    drop(stdout_handle.take());
+                    drop(stderr_handle.take());
+                    self.record_timeout(tool_name);
+                    return Err(ExecutorError::Timeout {
+                        tool: tool_name.clone(),
+                        timeout_ms: timeout.as_millis() as u64,
+                    });
+                }
+            }
+        };
+
+        // The tool exited on its own, so whatever made earlier runs hang is over.
+        self.clear_timeouts(tool_name);
+
+        let stdout = join_reader(stdout_handle.take()).map_err(|e| ExecutorError::IoError { message: e })?;
+        let stderr = join_reader(stderr_handle.take()).map_err(|e| ExecutorError::IoError { message: e })?;
+        let exit_code = status.code().unwrap_or(-1);
+
+        Ok(ToolOutput {
+            stdout,
+            stderr,
+            exit_code,
+            success: status.success(),
+        })
+    }
+
+    /// Prefer reliable stdin checks for the explicit djLint and Shuck modes.
+    /// Unknown and older versions retain the formatter-comparison path.
+    pub(crate) fn format_check(
+        &self,
+        tool_def: &ToolDefinition,
+        native_check: Option<&ToolDefinition>,
+        input: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<FormatCheckOutput, ExecutorError> {
+        let Some(check) = native_check.filter(|check| self.native_check_available(check, timeout_ms)) else {
+            return self
+                .format(tool_def, input, timeout_ms)
+                .map(FormatCheckOutput::Formatted);
+        };
+        let output = self.execute(check, input, false, timeout_ms)?;
+        if output.success {
+            // djLint prints formatted stdin even for clean checks. Compare it
+            // when available, which also protects a long-lived process whose
+            // version-manager shim switched back to an older implementation.
+            return Ok(if check.command[0] == "djlint" && !output.stdout.trim().is_empty() {
+                FormatCheckOutput::Formatted(output.stdout)
+            } else {
+                FormatCheckOutput::Native { changed: false }
+            });
+        }
+        // djLint returns the formatted stdin on stdout even with --check. Its
+        // crashes also exit 1, so require changed content and no error on stderr.
+        // Shuck's formatting-needed exit is silent; parse failures exit 2.
+        let dirty = output.exit_code == 1
+            && output.stderr.trim().is_empty()
+            && if check.command[0] == "shuck" {
+                output.stdout.trim().is_empty()
+            } else {
+                !output.stdout.trim().is_empty() && output.stdout != input
+            };
+        if dirty {
+            Ok(if check.command[0] == "djlint" {
+                FormatCheckOutput::Formatted(output.stdout)
+            } else {
+                FormatCheckOutput::Native { changed: true }
+            })
+        } else {
+            Err(ExecutorError::ExecutionFailed {
+                tool: check.command[0].clone(),
+                message: format!(
+                    "Exit code {}: {}",
+                    output.exit_code,
+                    if output.stderr.trim().is_empty() {
+                        &output.stdout
+                    } else {
+                        &output.stderr
+                    }
+                ),
+            })
+        }
+    }
+
+    fn native_check_available(&self, tool_def: &ToolDefinition, timeout_ms: Option<u64>) -> bool {
+        let Some(tool) = tool_def.command.first() else {
+            return false;
+        };
+        if !matches!(tool.as_str(), "djlint" | "shuck") {
+            return false;
+        }
+        let Some(path) = self.resolve_binary(tool).and_then(|path| path.canonicalize().ok()) else {
+            return false;
+        };
+        let Ok(metadata) = path.metadata() else {
+            return false;
+        };
+        let key = (tool.clone(), path, metadata.modified().ok(), metadata.len());
+        let mut capabilities = CHECK_CAPABILITIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(available) = capabilities.get(&key) {
+            return *available;
+        }
+        let mut probe = tool_def.clone();
+        probe.command = vec![tool.clone(), "--version".to_string()];
+        probe.stdin = false;
+        probe.lint_args.clear();
+        probe.format_args.clear();
+        let available = self
+            .execute(&probe, "", false, timeout_ms)
+            .is_ok_and(|output| output.success && supports_native_check_version(tool, &output.stdout));
+        capabilities.insert(key, available);
+        available
+    }
+
+    /// Execute a tool for formatting (returns formatted content).
+    ///
+    /// A formatter that succeeds but prints nothing for a non-empty block has
+    /// failed: taking its output would erase the block, and reporting success
+    /// would claim the block was formatted. Typically a linter configured as a
+    /// formatter, which validates its input and prints nothing.
+    pub fn format(
+        &self,
+        tool_def: &ToolDefinition,
+        input: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<String, ExecutorError> {
+        let output = self.execute(tool_def, input, true, timeout_ms)?;
+
+        if output.success && tool_def.stdout {
+            if output.stdout.trim().is_empty() && !input.trim().is_empty() {
+                return Err(ExecutorError::ExecutionFailed {
+                    tool: tool_def.command.first().cloned().unwrap_or_default(),
+                    message: "Formatter printed no output for a non-empty code block".to_string(),
+                });
+            }
+            Ok(output.stdout)
+        } else if !output.success {
+            let exit_code = output.exit_code;
+            let stderr = &output.stderr;
+            Err(ExecutorError::ExecutionFailed {
+                tool: tool_def.command.first().cloned().unwrap_or_default(),
+                message: format!("Exit code {exit_code}: {stderr}"),
+            })
+        } else {
+            // Tool doesn't output to stdout, which is unusual for a formatter
+            Err(ExecutorError::ExecutionFailed {
+                tool: tool_def.command.first().cloned().unwrap_or_default(),
+                message: "Formatter doesn't output to stdout".to_string(),
+            })
+        }
+    }
+
+    /// Execute a tool for linting (returns diagnostics).
+    pub fn lint(
+        &self,
+        tool_def: &ToolDefinition,
+        input: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<ToolOutput, ExecutorError> {
+        self.execute(tool_def, input, false, timeout_ms)
+    }
+}
+
+/// These stable releases have verified stdin check semantics. Unknown output,
+/// prereleases, and earlier releases keep comparison rather than guessing.
+fn supports_native_check_version(tool: &str, output: &str) -> bool {
+    let prefix = match tool {
+        "djlint" => "djlint, version ",
+        "shuck" => "shuck ",
+        _ => return false,
+    };
+    let Some(version) = output.trim().strip_prefix(prefix) else {
+        return false;
+    };
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let Ok(parts) = parts
+        .iter()
+        .map(|part| part.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    let minimum = if tool == "djlint" { [1, 39, 5] } else { [0, 2, 2] };
+    parts.as_slice() >= minimum.as_slice()
+}
+
+fn read_pipe_to_string<R: Read>(mut pipe: R, strict_utf8: bool) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    pipe.read_to_end(&mut buf)?;
+    if strict_utf8 {
+        String::from_utf8(buf).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Tool stdout is not valid UTF-8: {error}"),
+            )
+        })
+    } else {
+        Ok(String::from_utf8_lossy(&buf).to_string())
+    }
+}
+
+fn join_reader(handle: Option<thread::JoinHandle<std::io::Result<String>>>) -> Result<String, String> {
+    match handle {
+        Some(handle) => match handle.join() {
+            Ok(res) => res.map_err(|e| format!("Failed to read output: {e}")),
+            Err(_) => Err("Output reader thread panicked".to_string()),
+        },
+        None => Ok(String::new()),
+    }
+}
+
+impl Default for ToolExecutor {
+    fn default() -> Self {
+        Self::new(30_000) // 30 seconds default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn bun_fmt_rejects_local_entry_points_and_package_binaries() {
+        for entry in ["fmt", "fmt.ts", "fmt/index.js", "node_modules/.bin/fmt"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(entry);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "console.log('not formatted code')").unwrap();
+            let error = check_bun_fmt_scripts(directory.path()).unwrap_err();
+            assert!(error.contains("instead of the built-in formatter"), "{entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn bun_fmt_rejects_scripts_in_the_project_or_an_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("docs");
+        std::fs::create_dir(&nested).unwrap();
+        let manifest = directory.path().join("package.json");
+        std::fs::write(&manifest, r#"{"scripts":{"fmt":"echo not a formatter"}}"#).unwrap();
+        let error = check_bun_fmt_scripts(&nested).unwrap_err();
+        assert!(error.contains("instead of the built-in formatter"));
+        std::fs::write(&manifest, r#"{"scripts":{"format":"prettier ."}}"#).unwrap();
+        assert!(check_bun_fmt_scripts(&nested).is_ok());
+        std::fs::write(&manifest, "invalid json").unwrap();
+        assert!(check_bun_fmt_scripts(&nested).is_err());
+    }
+
+    #[test]
+    fn test_executor_creation() {
+        let executor = ToolExecutor::new(10_000);
+        // Just verify it creates successfully
+        assert_eq!(executor.default_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn test_tool_not_found() {
+        let executor = ToolExecutor::default();
+        let tool_def = ToolDefinition {
+            command: vec!["nonexistent-tool-xyz123".to_string()],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        let result = executor.execute(&tool_def, "test", false, None);
+        assert!(matches!(result, Err(ExecutorError::ToolNotFound { .. })));
+    }
+
+    #[test]
+    fn test_empty_command() {
+        let executor = ToolExecutor::default();
+        let tool_def = ToolDefinition {
+            command: vec![],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        let result = executor.execute(&tool_def, "test", false, None);
+        assert!(matches!(result, Err(ExecutorError::ExecutionFailed { .. })));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_cat() {
+        let executor = ToolExecutor::isolated(30_000);
+        let tool_def = ToolDefinition {
+            command: vec!["cat".to_string()],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        let result = executor.execute(&tool_def, "hello world", false, None);
+        let output = result.expect("cat should succeed");
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "hello world");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_timeout() {
+        let executor = ToolExecutor::isolated(5);
+        let tool_def = ToolDefinition {
+            command: vec!["sleep".to_string(), "1".to_string()],
+            stdin: false,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        let result = executor.execute(&tool_def, "", false, Some(5));
+        assert!(matches!(result, Err(ExecutorError::Timeout { .. })));
+    }
+
+    /// A tool's exit has to be noticed when it happens, not at the next tick of a poll
+    /// interval: for a fast formatter or linter that interval is most of the cost of
+    /// running it once per code block. The fastest of several runs is compared, so a
+    /// scheduling delay on a loaded machine cannot fail a correct implementation, while
+    /// a 10ms poll can never produce a run under that interval.
+    #[test]
+    #[cfg(unix)]
+    fn test_performance_exit_is_noticed_without_a_poll_interval() {
+        let executor = ToolExecutor::isolated(30_000);
+        let tool_def = ToolDefinition {
+            command: vec!["true".to_string()],
+            stdin: false,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        let fastest = (0..20)
+            .map(|_| {
+                let started = Instant::now();
+                executor
+                    .execute(&tool_def, "", false, None)
+                    .expect("true should succeed");
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            fastest < Duration::from_millis(8),
+            "fastest of 20 runs of `true` took {fastest:?}"
+        );
+    }
+
+    /// A tool definition whose process outlives its own timeout, and leaves a child
+    /// holding the stdout pipe open after the tool itself is killed.
+    #[cfg(unix)]
+    fn descendant_holds_stdout_tool() -> ToolDefinition {
+        ToolDefinition {
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30 & exec sleep 30".to_string(),
+            ],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        }
+    }
+
+    /// The configured timeout has to bound the call even when the killed tool leaves a
+    /// descendant holding the write end of the stdout pipe. Reading that pipe to EOF
+    /// waits for the descendant, which is precisely the process the timeout is for.
+    #[test]
+    #[cfg(unix)]
+    fn test_timeout_bounds_execution_when_a_descendant_holds_stdout() {
+        let executor = ToolExecutor::isolated(200);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let result = executor.execute(&descendant_holds_stdout_tool(), "input", true, Some(200));
+            let _ = tx.send((started.elapsed(), result));
+        });
+
+        // Generous next to the 200ms timeout, and far below the 30s the descendant
+        // lives for, so this only fires if the call waited on the descendant.
+        let (elapsed, result) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("execute() did not return: the timeout bounded nothing");
+        assert!(
+            matches!(result, Err(ExecutorError::Timeout { .. })),
+            "expected a timeout, got {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(10), "execute() took {elapsed:?}");
+    }
+
+    /// A hanging tool costs its whole timeout every time it is invoked, so a run over
+    /// many code blocks must stop invoking it rather than pay that repeatedly.
+    #[test]
+    #[cfg(unix)]
+    fn test_a_hanging_tool_is_skipped_after_repeated_timeouts() {
+        let executor = ToolExecutor::isolated(50);
+        let tool_def = ToolDefinition {
+            command: vec!["sh".to_string(), "-c".to_string(), "exec sleep 30".to_string()],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        for attempt in 1..=TIMEOUT_LIMIT {
+            let result = executor.execute(&tool_def, "input", true, Some(50));
+            assert!(
+                matches!(result, Err(ExecutorError::Timeout { .. })),
+                "attempt {attempt} should time out, got {result:?}"
+            );
+        }
+
+        let started = Instant::now();
+        let result = executor.execute(&tool_def, "input", true, Some(50));
+        match result {
+            Err(ExecutorError::RepeatedTimeouts {
+                timeouts, timeout_ms, ..
+            }) => {
+                assert_eq!(timeouts, TIMEOUT_LIMIT);
+                assert_eq!(timeout_ms, 50);
+            }
+            other => panic!("expected the tool to be skipped, got {other:?}"),
+        }
+        // Skipping means not spawning it, so this must not cost another timeout.
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "skipping still took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// One slow block must not disable a tool for the rest of the run, so exiting on its
+    /// own clears whatever a tool accumulated before.
+    #[test]
+    #[cfg(unix)]
+    fn test_exiting_normally_clears_earlier_timeouts() {
+        let executor = ToolExecutor::isolated(50);
+        // Both definitions run through `sh`, which is what the tally is keyed on.
+        let hangs = ToolDefinition {
+            command: vec!["sh".to_string(), "-c".to_string(), "exec sleep 30".to_string()],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+        let exits = ToolDefinition {
+            command: vec!["sh".to_string(), "-c".to_string(), "cat".to_string()],
+            stdin: true,
+            stdout: true,
+            lint_args: vec![],
+            format_args: vec![],
+        };
+
+        for _ in 0..TIMEOUT_LIMIT - 1 {
+            assert!(matches!(
+                executor.execute(&hangs, "input", true, Some(50)),
+                Err(ExecutorError::Timeout { .. })
+            ));
+        }
+        assert_eq!(executor.timeout_count("sh"), TIMEOUT_LIMIT - 1);
+
+        // The 50ms default exists only to make `hangs` time out quickly. A tool that
+        // exits on its own needs room to spawn on a loaded machine, or it times out too.
+        let output = executor
+            .execute(&exits, "hello", true, Some(10_000))
+            .expect("cat should exit");
+        assert_eq!(output.stdout.trim(), "hello");
+        assert_eq!(executor.timeout_count("sh"), 0, "a clean exit must clear the tally");
+    }
+
+    /// The tally outlives one executor, since a fresh executor is built per file and a
+    /// hanging tool would otherwise be retried from scratch for every file in the run.
+    #[test]
+    fn test_the_shared_tally_carries_across_executors() {
+        // A name no real tool answers to, so this neither reads nor disturbs the tally
+        // of any tool another test in this process may be running.
+        let key = "rumdl-test-only-shared-tally-probe";
+        let first = ToolExecutor::new(50);
+        let second = ToolExecutor::new(50);
+        let alone = ToolExecutor::isolated(50);
+
+        let before = second.timeout_count(key);
+        first.record_timeout(key);
+
+        assert_eq!(
+            second.timeout_count(key),
+            before + 1,
+            "executors built for different files must share one tally"
+        );
+        assert_eq!(alone.timeout_count(key), 0, "an isolated executor keeps its own tally");
+
+        first.clear_timeouts(key);
+        assert_eq!(second.timeout_count(key), 0);
+    }
+}
+
+#[cfg(test)]
+mod native_check_version_tests {
+    use super::supports_native_check_version;
+
+    #[test]
+    fn only_recognized_stable_versions_with_verified_stdin_support_are_admitted() {
+        for (tool, version, expected) in [
+            ("djlint", "djlint, version 1.39.4", false),
+            ("djlint", "djlint, version 1.39.5", true),
+            ("djlint", "djlint, version 1.100.0", true),
+            ("shuck", "shuck 0.2.1", false),
+            ("shuck", "shuck 0.2.2", true),
+            ("shuck", "shuck 0.10.0", true),
+            ("djlint", "djlint, version 1.46.4rc1", false),
+            ("djlint", "djlint, version 1.39.5.post1", false),
+            ("shuck", "shuck 0.2.3-beta.1", false),
+            ("shuck", "shuck v0.2.2", false),
+            ("shuck", "shuck 0.2.2+build", false),
+            ("shuck", "shuck 0.2", false),
+            ("shuck", "shuck 0.2.2.1", false),
+            ("djlint", "shuck 1.46.4", false),
+            ("djlint", "", false),
+        ] {
+            assert_eq!(supports_native_check_version(tool, version), expected, "{version}");
+        }
+    }
+}
