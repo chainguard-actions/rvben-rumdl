@@ -1,0 +1,26 @@
+name: Test informational mode with output file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/fixtures/bad
+          fail-on-error: "false"
+          output-file: out-dir/results.txt
+      - name: Assert output file contents
+        run: |
+          if [ ! -f out-dir/results.txt ]; then
+            echo "FAIL: output file not written"
+            exit 1
+          fi
+          cat out-dir/results.txt
+          if ! grep -qE 'MD012|MD009' out-dir/results.txt; then
+            echo "FAIL: expected MD012/MD009 violations in output file"
+            exit 1
+          fi
+          echo "PASS"

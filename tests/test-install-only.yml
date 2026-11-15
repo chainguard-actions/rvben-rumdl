@@ -1,0 +1,30 @@
+name: Test install-only
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          install-only: "true"
+          # would fail if linting happened
+          path: tests/fixtures/bad
+      - name: Assert rumdl is on PATH
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "version output: $VERSION"
+          if ! command -v rumdl; then
+            echo "FAIL: rumdl not on PATH"
+            exit 1
+          fi
+          out="$(rumdl --version)"
+          echo "rumdl --version: $out"
+          if [ -z "$VERSION" ] || ! echo "$out" | grep -qF "$VERSION"; then
+            echo "FAIL: version mismatch"
+            exit 1
+          fi
+          echo "PASS"
