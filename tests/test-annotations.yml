@@ -1,0 +1,33 @@
+name: Test annotations report type
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare input files
+        run: |
+          mkdir -p rumdl-input
+          printf '[MD013]\nline-length = 200\n' > rumdl-input/rumdl.toml
+          printf '# Title\n\n#Bad heading\n' > rumdl-input/bad.md
+      - id: action
+        uses: .
+        with:
+          path: rumdl-input/bad.md
+          config: rumdl-input/rumdl.toml
+          report-type: annotations
+          fail-on-error: "false"
+          output-file: rumdl-annotations.txt
+      - name: Assert github annotation format
+        run: |
+          cat rumdl-annotations.txt
+          if ! grep -qE '^::(error|warning|notice)' rumdl-annotations.txt; then
+            echo "FAIL: expected GitHub annotation lines"
+            exit 1
+          fi
+          if ! grep -q "MD018" rumdl-annotations.txt; then
+            echo "FAIL: expected MD018 in annotations"
+            exit 1
+          fi
+          echo "PASS"

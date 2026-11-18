@@ -1,0 +1,48 @@
+name: Test fmt rewrites files
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare input files
+        run: |
+          mkdir -p rumdl-input
+          printf '[MD013]\nline-length = 200\n' > rumdl-input/rumdl.toml
+          printf '# Title\n\n#Bad heading\n' > rumdl-input/fmt.md
+      - id: action
+        uses: .
+        with:
+          command: fmt
+          path: rumdl-input/fmt.md
+          config: rumdl-input/rumdl.toml
+          fail-on-error: "false"
+      - name: Assert file was rewritten
+        run: |
+          cat -A rumdl-input/fmt.md
+          if grep -q '^#Bad heading' rumdl-input/fmt.md; then
+            echo "FAIL: file was not reformatted (MD018 still present)"
+            exit 1
+          fi
+          # rumdl may also adjust the heading level (e.g. MD025 single H1),
+          # so accept any ATX heading level with a space after the hashes.
+          if ! grep -qE '^#+ Bad heading$' rumdl-input/fmt.md; then
+            echo "FAIL: expected a properly spaced 'Bad heading' heading after fmt"
+            exit 1
+          fi
+          if ! grep -q '^# Title$' rumdl-input/fmt.md; then
+            echo "FAIL: title heading should be preserved"
+            exit 1
+          fi
+          echo "PASS"
+      - name: Assert outputs set
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+        run: |
+          echo "version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output empty"
+            exit 1
+          fi
+          echo "PASS"

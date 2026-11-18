@@ -1,0 +1,33 @@
+name: Test fail-on-error false with output-file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare input files
+        run: |
+          mkdir -p rumdl-input
+          printf '[MD013]\nline-length = 200\n' > rumdl-input/rumdl.toml
+          printf '# Title\n\n#Bad heading\n' > rumdl-input/bad.md
+      - id: action
+        uses: .
+        with:
+          path: rumdl-input/bad.md
+          config: rumdl-input/rumdl.toml
+          fail-on-error: "false"
+          output-file: rumdl-out/nested/results.txt
+      - name: Assert output file contains violation
+        run: |
+          f="rumdl-out/nested/results.txt"
+          if [ ! -f "$f" ]; then
+            echo "FAIL: output file not created"
+            exit 1
+          fi
+          cat "$f"
+          if ! grep -q "MD018" "$f"; then
+            echo "FAIL: expected MD018 in results"
+            exit 1
+          fi
+          echo "PASS"

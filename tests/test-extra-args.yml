@@ -1,0 +1,28 @@
+name: Test extra args disable rule
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare input files
+        run: |
+          mkdir -p rumdl-input
+          printf '[MD013]\nline-length = 200\n' > rumdl-input/rumdl.toml
+          printf '# Title\n\n#Bad heading\n' > rumdl-input/bad.md
+      - id: action
+        uses: .
+        with:
+          path: rumdl-input/bad.md
+          config: rumdl-input/rumdl.toml
+          args: --extend-disable MD018
+          output-file: rumdl-args.txt
+      - name: Assert MD018 not reported
+        run: |
+          cat rumdl-args.txt
+          if grep -q "MD018" rumdl-args.txt; then
+            echo "FAIL: MD018 should have been disabled"
+            exit 1
+          fi
+          echo "PASS"
