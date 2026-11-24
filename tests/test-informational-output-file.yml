@@ -1,0 +1,36 @@
+name: Test fail-on-error false with output file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create markdown with violations and config
+        run: |
+          mkdir -p "$RUNNER_TEMP/md"
+          printf '# Title\n\nSome text. \n' > "$RUNNER_TEMP/md/bad.md"
+          printf '[global]\ndisable = ["MD033"]\n' > "$RUNNER_TEMP/rumdl-test.toml"
+          echo "MD_DIR=$RUNNER_TEMP/md" >> "$GITHUB_ENV"
+          echo "CFG=$RUNNER_TEMP/rumdl-test.toml" >> "$GITHUB_ENV"
+      - id: action
+        uses: .
+        with:
+          path: ${{ env.MD_DIR }}/bad.md
+          config: ${{ env.CFG }}
+          fail-on-error: "false"
+          output-file: ${{ runner.temp }}/out/nested/results.txt
+      - name: Assert output file contains violation
+        run: |
+          F="$RUNNER_TEMP/out/nested/results.txt"
+          if [ ! -f "$F" ]; then
+            echo "FAIL: output file not created"
+            exit 1
+          fi
+          echo "--- results ---"
+          cat "$F"
+          if ! grep -q 'MD009' "$F"; then
+            echo "FAIL: expected MD009 in results"
+            exit 1
+          fi
+          echo "PASS"

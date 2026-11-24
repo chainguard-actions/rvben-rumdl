@@ -1,0 +1,35 @@
+name: Test fmt rewrites files
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create unformatted markdown and config
+        run: |
+          mkdir -p "$RUNNER_TEMP/md"
+          printf '# Title\n\nSome text. \n' > "$RUNNER_TEMP/md/bad.md"
+          printf '[global]\ndisable = ["MD033"]\n' > "$RUNNER_TEMP/rumdl-test.toml"
+          echo "MD_DIR=$RUNNER_TEMP/md" >> "$GITHUB_ENV"
+          echo "CFG=$RUNNER_TEMP/rumdl-test.toml" >> "$GITHUB_ENV"
+      - id: action
+        uses: .
+        with:
+          command: fmt
+          path: ${{ env.MD_DIR }}/bad.md
+          config: ${{ env.CFG }}
+      - name: Assert file was rewritten
+        run: |
+          F="$MD_DIR/bad.md"
+          echo "--- content ---"
+          cat -A "$F"
+          if grep -q ' $' "$F"; then
+            echo "FAIL: trailing whitespace still present"
+            exit 1
+          fi
+          if ! grep -q 'Some text.' "$F"; then
+            echo "FAIL: content lost"
+            exit 1
+          fi
+          echo "PASS"

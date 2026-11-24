@@ -1,0 +1,40 @@
+name: Test check on clean markdown
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean markdown and config
+        run: |
+          mkdir -p "$RUNNER_TEMP/md"
+          printf '# Title\n\nSome clean text.\n' > "$RUNNER_TEMP/md/clean.md"
+          printf '[global]\ndisable = ["MD033"]\n' > "$RUNNER_TEMP/rumdl-test.toml"
+          echo "MD_DIR=$RUNNER_TEMP/md" >> "$GITHUB_ENV"
+          echo "CFG=$RUNNER_TEMP/rumdl-test.toml" >> "$GITHUB_ENV"
+      - id: action
+        uses: .
+        with:
+          path: ${{ env.MD_DIR }}/clean.md
+          config: ${{ env.CFG }}
+      - name: Assert outputs
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+          RPATH: ${{ steps.action.outputs.rumdl-path }}
+        run: |
+          echo "version: $VERSION"
+          echo "path: $RPATH"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "FAIL: rumdl-version does not look like a semver"
+            exit 1
+          fi
+          if [ ! -x "$RPATH" ]; then
+            echo "FAIL: rumdl-path is not an executable file"
+            exit 1
+          fi
+          echo "PASS"
