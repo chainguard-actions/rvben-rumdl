@@ -1,0 +1,28 @@
+name: Test extra args disable rules
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare file with only MD009 violation
+        run: |
+          mkdir -p args-work
+          cp tests/fixtures/rumdl-act/unformatted.md args-work/doc.md
+      - id: action
+        uses: .
+        with:
+          path: args-work/doc.md
+          config: tests/fixtures/rumdl-act/rumdl.toml
+          args: --disable MD009
+      - name: Assert success with rule disabled
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success with MD009 disabled"
+            exit 1
+          fi
+          echo "PASS"

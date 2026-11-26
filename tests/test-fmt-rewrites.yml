@@ -1,0 +1,36 @@
+name: Test fmt rewrites files
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare working copy
+        run: |
+          mkdir -p fmt-work
+          cp tests/fixtures/rumdl-act/unformatted.md fmt-work/doc.md
+          if ! grep -qE ' +$' fmt-work/doc.md; then
+            echo "SETUP FAIL: fixture lacks trailing spaces"
+            exit 1
+          fi
+      - id: action
+        uses: .
+        with:
+          command: fmt
+          path: fmt-work/doc.md
+          config: tests/fixtures/rumdl-act/rumdl.toml
+          fail-on-error: "false"
+      - name: Assert file was rewritten
+        run: |
+          echo "--- doc.md ---"
+          cat -A fmt-work/doc.md
+          if grep -qE ' +$' fmt-work/doc.md; then
+            echo "FAIL: trailing spaces still present"
+            exit 1
+          fi
+          if ! grep -q 'Text with trailing spaces.' fmt-work/doc.md; then
+            echo "FAIL: content lost"
+            exit 1
+          fi
+          echo "PASS"
