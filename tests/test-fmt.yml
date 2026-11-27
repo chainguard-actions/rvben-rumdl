@@ -1,0 +1,36 @@
+name: Test fmt rewrites files
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare scratch copy
+        run: |
+          mkdir -p "$RUNNER_TEMP/fmt"
+          cp tests/act-fixtures/bad.md "$RUNNER_TEMP/fmt/bad.md"
+      - id: action
+        uses: .
+        with:
+          command: fmt
+          path: ${{ runner.temp }}/fmt/bad.md
+          args: --no-config
+      - name: Assert file was rewritten
+        env:
+          FILE: ${{ runner.temp }}/fmt/bad.md
+        run: |
+          cat -A "$FILE"
+          if cmp -s "$FILE" tests/act-fixtures/bad.md; then
+            echo "FAIL: file was not modified"
+            exit 1
+          fi
+          if ! grep -q '^# Bad Heading' "$FILE"; then
+            echo "FAIL: expected heading to be fixed to '# Bad Heading'"
+            exit 1
+          fi
+          if grep -q ' $' "$FILE"; then
+            echo "FAIL: trailing whitespace remains"
+            exit 1
+          fi
+          echo "PASS"

@@ -1,0 +1,34 @@
+name: Test basic check on clean file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/act-fixtures/good.md
+          args: --no-config
+      - name: Assert outputs
+        env:
+          VERSION: ${{ steps.action.outputs.rumdl-version }}
+          RPATH: ${{ steps.action.outputs.rumdl-path }}
+        run: |
+          echo "version: $VERSION"
+          echo "path: $RPATH"
+          if [ -z "$VERSION" ]; then
+            echo "FAIL: rumdl-version output is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "FAIL: rumdl-version does not look like a semver"
+            exit 1
+          fi
+          if [ -z "$RPATH" ] || [ ! -x "$RPATH" ]; then
+            echo "FAIL: rumdl-path is empty or not executable"
+            exit 1
+          fi
+          "$RPATH" --version
+          echo "PASS"

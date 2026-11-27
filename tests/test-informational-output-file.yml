@@ -1,0 +1,29 @@
+name: Test fail-on-error false with output file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/act-fixtures/bad.md
+          args: --no-config
+          fail-on-error: "false"
+          output-file: ${{ runner.temp }}/rumdl-out/results.txt
+      - name: Assert output file contains violations
+        env:
+          OUT: ${{ runner.temp }}/rumdl-out/results.txt
+        run: |
+          if [ ! -f "$OUT" ]; then
+            echo "FAIL: output file not created"
+            exit 1
+          fi
+          cat "$OUT"
+          if ! grep -q "MD018" "$OUT"; then
+            echo "FAIL: expected MD018 violation in output"
+            exit 1
+          fi
+          echo "PASS"

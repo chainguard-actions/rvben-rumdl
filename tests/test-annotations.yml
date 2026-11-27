@@ -1,0 +1,34 @@
+name: Test annotations report type
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          path: tests/act-fixtures/bad.md
+          args: --no-config
+          report-type: annotations
+          fail-on-error: "false"
+          output-file: ${{ runner.temp }}/annotations.txt
+      - name: Assert GitHub annotation format
+        env:
+          OUT: ${{ runner.temp }}/annotations.txt
+        run: |
+          if [ ! -f "$OUT" ]; then
+            echo "FAIL: output file not created"
+            exit 1
+          fi
+          cat "$OUT"
+          if ! grep -qE '^::(error|warning|notice)' "$OUT"; then
+            echo "FAIL: expected GitHub workflow command annotations"
+            exit 1
+          fi
+          if ! grep -q "MD018" "$OUT"; then
+            echo "FAIL: expected MD018 in annotations"
+            exit 1
+          fi
+          echo "PASS"
